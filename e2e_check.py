@@ -1,0 +1,308 @@
+# -*- coding: utf-8 -*-
+"""
+端到端自检 —— **按 Claude Code 的方式**驱动 shim 跑一个真实任务。
+
+    python e2e_check.py              # 自起一个 shim（独立端口），跑完自动关
+    python e2e_check.py --keep       # 保留临时产物，方便看现场
+    python e2e_check.py --shim-url http://127.0.0.1:8799    # 用已在跑的那个
+
+═══ 为什么要有这第三层 ═══
+
+    selftest.py --fast    单元：解析、提示词、锁……
+    selftest.py --live    浏览器集成：真的发一条消息、真的传一个附件
+    本文件                端到端：**从「Claude Code 会怎么发请求」出发，走完整条链路**
+
+前两层全都绿的情况下，用户还是踩了一整晚的坑 —— 因为真正出问题的是
+**「模型怎么调工具 / 我们怎么把结果喂回去」这一层**，而它一直没人测：
+
+  · 长内容被网页长度上限截断 → 半截工具调用发给上游 → "Error writing file"
+  · 重试开新对话却**漏传附件** → 模型说「我看不到图」，死循环
+  · 服务端限流只剩个 `{"` 残渣 → 被当成「正经回答」交出去
+  · 「继续生成」被自己连点打断 → 长文件永远写不完
+
+这些**单元测试一条都测不出来**，因为它们的根因不在解析函数里，
+而在「一轮完整的对话是怎么跑下来的」。
+
+═══ 它测什么 ═══
+
+一个真实的写文件任务：让模型写一个两百来行的 Python 脚本并跑通。
+
+**红的条件**（= 链路坏了）：
+  1. 文件没写出来，或明显偏小 —— 多半被长度上限截断了
+  2. 出现「缺 content」—— 长内容被截断，半截工具调用发给了上游
+  3. 跑满轮数还没收工 —— 轮数失控
+
+**只警告不红**（= 效率问题，不是坏了）：
+  · 重试次数、Write 次数、碰上几次「服务器繁忙」
+
+  为什么不红：模型偶尔写坏一次 JSON 是正常的，重试机制本来就为此而设；
+  服务器繁忙更是 DeepSeek 那边的事。把这些算成失败，自检会时红时绿，
+  很快就没人看了 —— 一个没人看的自检等于没有。
+"""
+import argparse
+import json
+import os
+import re
+import subprocess
+import sys
+import time
+import urllib.error
+import urllib.request
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+LOG_DIR = os.path.join(HERE, 'logs')
+TMP_DIR = os.path.join(HERE, '_e2e_tmp')
+
+MAX_ROUNDS = 25
+DEFAULT_PORT = 8798          # 故意避开 8799 —— 别抢用户正在用的那个 shim
+
+SYS = ('你是一个 Windows 上的编程助手。你可以读写文件、跑 PowerShell。'
+       '工作目录：' + TMP_DIR)
+
+TOOLS = [
+    {'name': 'Write', 'description': '把内容写入文件（覆盖）',
+     'input_schema': {'type': 'object', 'properties': {
+         'file_path': {'type': 'string'}, 'content': {'type': 'string'}},
+         'required': ['file_path', 'content']}},
+    {'name': 'Read', 'description': '读文件',
+     'input_schema': {'type': 'object', 'properties': {
+         'file_path': {'type': 'string'}}, 'required': ['file_path']}},
+    {'name': 'PowerShell', 'description': '执行一条 PowerShell 命令',
+     'input_schema': {'type': 'object', 'properties': {
+         'command': {'type': 'string'}}, 'required': ['command']}},
+]
+
+
+def task_text(outfile):
+    """
+    任务刻意设计成「必须写一个**比较长**的文件」。
+
+    ★ 为什么非要长：这一层要抓的 bug（长度上限截断、半截工具调用、
+      「继续生成」写不完）**只有在内容长到超过单条回复上限时才会出现**。
+      写个十行的 hello world 永远测不出来。
+    """
+    return ('请写一个 Python 脚本到 %s。\n'
+            '脚本用 python-docx 生成一份 Word 文档，内容是「二阶系统时域指标」'
+            '教学讲义，含：标题、公式说明、一个 Routh 判据示例、一个根轨迹说明'
+            '段落、一个 MATLAB 代码附录。要有中文字体设置（宋体/黑体）、'
+            '标题层级、公式用居中段落。\n'
+            '内容要完整、能直接跑通，长度 200~300 行。\n'
+            '写完后**运行它**，确认真的生成了 docx，再告诉我文件路径和字节数。'
+            % outfile)
+
+
+# ────────────────────────── shim 的起停 ──────────────────────────
+
+def shim_up(url, timeout=3):
+    try:
+        with urllib.request.urlopen(url.rstrip('/') + '/health', timeout=timeout) as r:
+            return r.status == 200
+    except Exception:
+        return False
+
+
+def start_shim(port):
+    """
+    自己起一个，跑完就关 —— 这样不依赖用户是否开着 dsc。
+
+    ★ 自己的 shim 的 stderr **单独收进一个文件**，用来数重试次数。
+      不能去读公共的 logs/YYYY-MM-DD.log —— 那个文件是**所有 shim 共写**
+      的，用户可能正开着 dsc，他那边每一次重试都会被算到我们头上
+      （实测第一版就数错了：把自己这轮的 2 次重试数成了 4 次）。
+      ds.log() 同时往 stderr 和公共日志各写一份，所以收 stderr 就拿得到，
+      而且**只有我们自己**的行。
+    """
+    errpath = os.path.join(TMP_DIR, 'shim_stderr.log')
+    errf = open(errpath, 'wb')
+    py = sys.executable
+    proc = subprocess.Popen(
+        [py, '-u', os.path.join(HERE, 'claude_shim.py'), '--port', str(port)],
+        cwd=HERE, stdout=errf, stderr=errf)
+    url = 'http://127.0.0.1:%d' % port
+    t0 = time.time()
+    while time.time() - t0 < 90:
+        if shim_up(url):
+            return proc, url, errpath
+        if proc.poll() is not None:
+            raise RuntimeError('shim 起来就退了，先手动跑一下看报什么错')
+        time.sleep(1.0)
+    proc.kill()
+    raise RuntimeError('shim 90 秒还没起来')
+
+
+def read_own_log(path):
+    try:
+        with open(path, encoding='utf-8', errors='replace') as f:
+            return f.read()
+    except OSError:
+        return ''
+
+
+# ────────────────────────── 工具执行 ──────────────────────────
+
+def run_tool(name, inp):
+    if name == 'Write':
+        p = inp.get('file_path') or ''
+        c = inp.get('content')
+        if not c:
+            return '错误：content 是空的，文件没写成', True
+        os.makedirs(os.path.dirname(p) or '.', exist_ok=True)
+        with open(p, 'w', encoding='utf-8') as f:
+            f.write(c)
+        return '已写入 %s（%d 字）' % (p, len(c)), False
+    if name == 'Read':
+        try:
+            return open(inp.get('file_path') or '', encoding='utf-8',
+                        errors='replace').read()[:4000], False
+        except Exception as e:
+            return '读失败: %s' % e, True
+    if name == 'PowerShell':
+        try:
+            r = subprocess.run(
+                ['powershell', '-NoProfile', '-Command', inp.get('command') or ''],
+                capture_output=True, text=True, timeout=180,
+                encoding='utf-8', errors='replace')
+            return (r.stdout or '') + (r.stderr or ''), r.returncode != 0
+        except Exception as e:
+            return '执行失败: %s' % e, True
+    return '未知工具 ' + name, True
+
+
+# ────────────────────────── 主流程 ──────────────────────────
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument('--port', type=int, default=DEFAULT_PORT)
+    ap.add_argument('--shim-url', default=None,
+                    help='用已经跑着的 shim，而不是自己起一个')
+    ap.add_argument('--keep', action='store_true', help='保留临时产物')
+    ap.add_argument('--rounds', type=int, default=MAX_ROUNDS)
+    args = ap.parse_args()
+
+    os.makedirs(TMP_DIR, exist_ok=True)
+    outfile = os.path.join(TMP_DIR, 'gen_report.py')
+
+    proc, url, ownlog = None, args.shim_url, None
+    if url is None:
+        print('[e2e] 自己起一个 shim（端口 %d）…' % args.port)
+        proc, url, ownlog = start_shim(args.port)
+    else:
+        if not shim_up(url):
+            print('[e2e] ❌ %s 上没有 shim 在跑' % url)
+            return 2
+    print('[e2e] shim:', url)
+
+    msgs = [{'role': 'user', 'content': task_text(outfile)}]
+
+    writes, rounds, final, t0 = [], 0, '', time.time()
+    try:
+        for rounds in range(1, args.rounds + 1):
+            body = json.dumps({'model': 'deepseek-web', 'max_tokens': 8192,
+                               'system': SYS, 'tools': TOOLS, 'messages': msgs},
+                              ensure_ascii=False).encode('utf-8')
+            req = urllib.request.Request(
+                url.rstrip('/') + '/v1/messages', data=body,
+                headers={'Content-Type': 'application/json'})
+            try:
+                with urllib.request.urlopen(req, timeout=900) as r:
+                    resp = json.loads(r.read().decode('utf-8'))
+            except urllib.error.HTTPError as e:
+                print('[e2e] 第 %d 轮 HTTP %s：%s' % (rounds, e.code,
+                                                  e.read().decode('utf-8', 'replace')[:200]))
+                break
+            except Exception as e:
+                print('[e2e] 第 %d 轮请求失败：%s' % (rounds, str(e)[:200]))
+                break
+
+            blocks = resp.get('content') or []
+            final = ''.join(b.get('text', '') for b in blocks
+                            if b.get('type') == 'text')
+            uses = [b for b in blocks if b.get('type') == 'tool_use']
+            names = [b.get('name') for b in uses]
+            print('[e2e] 第 %2d 轮  %s' % (rounds, names or ('文本 %d 字' % len(final))))
+
+            if not uses:
+                break
+
+            results = []
+            for tu in uses:
+                if tu.get('name') == 'Write':
+                    writes.append(len((tu.get('input') or {}).get('content') or ''))
+                out, err = run_tool(tu.get('name'), tu.get('input') or {})
+                print('        %-11s → %s' % (tu.get('name'), out[:90].replace('\n', ' ')))
+                results.append({'type': 'tool_result', 'tool_use_id': tu.get('id'),
+                                'content': [{'type': 'text', 'text': out}],
+                                **({'is_error': True} if err else {})})
+            msgs.append({'role': 'assistant', 'content': blocks})
+            msgs.append({'role': 'user', 'content': results})
+    finally:
+        if proc:
+            proc.kill()
+
+    dt = time.time() - t0
+    delta = read_own_log(ownlog) if ownlog else ''
+
+    # ★ 数「重新问一次」那几行 —— 一次重试会打**两行**日志
+    #   （触发一行 + 结果一行），按 `[重试]` 数会把次数翻倍。
+    #   实测第一版就是这么把 2 次数成 4 次的。
+    retries = len(re.findall(r'\[重试\].*重新问一次', delta))
+    busy = len(re.findall(r'\[繁忙\]', delta))
+    continues = len(re.findall(r'\[续写\].*点「继续生成」', delta))
+    no_content = len(re.findall(r'缺 content', delta))
+
+    ok_file = os.path.exists(outfile)
+    size = os.path.getsize(outfile) if ok_file else 0
+    ran = bool(re.search(r'\.docx', final)) or ok_file
+
+    print()
+    print('=' * 62)
+    print('  轮数        %d' % rounds)
+    print('  耗时        %.0f 秒' % dt)
+    print('  Write 次数  %d  内容长度 %s' % (len(writes), writes))
+    print('  重试        %d 次（其中「缺 content」%d 次）' % (retries, no_content))
+    print('  繁忙        %d 次' % busy)
+    print('  续写        %d 次' % continues)
+    print('  产出        %s' % ('%d 字节' % size if ok_file else '★ 没有'))
+    print('=' * 62)
+
+    # 断言的取舍：
+    #   · 「写不出来 / 写坏了」= **坏掉**，必须红
+    #   · 「重试了几次」= **效率**问题，不红。模型偶尔写坏一次 JSON 是正常的，
+    #     重试机制本来就为此而设；只有**失控**（超过预算）才值得报警。
+    #     把它算成失败的话，这个自检会时红时绿，很快就没人看了。
+    fails, warns = [], []
+    if not ok_file or size < 3000:
+        fails.append('文件没写出来 / 太小（%d 字节）—— 多半被截断了' % size)
+    if no_content:
+        fails.append('出现「缺 content」%d 次 —— 长内容又被截断了' % no_content)
+    if rounds >= args.rounds:
+        fails.append('跑满了 %d 轮还没收工 —— 轮数失控' % args.rounds)
+    if len(writes) > 3:
+        warns.append('Write 调了 %d 次 —— 模型在分段绕路，偏慢' % len(writes))
+    if retries > 3:
+        warns.append('重试 %d 次 —— 偏多' % retries)
+    if busy:
+        warns.append('碰上服务器繁忙 %d 次（不是我们的问题，但会拖慢）' % busy)
+
+    for w in warns:
+        print('  ⚠️ ', w)
+    if fails:
+        print('  ❌ 不通过：')
+        for f in fails:
+            print('     ·', f)
+    else:
+        print('  ✅ 通过')
+
+    if not args.keep:
+        try:
+            import shutil
+            shutil.rmtree(TMP_DIR, ignore_errors=True)
+        except Exception:
+            pass
+    else:
+        print('  （--keep：产物留在 %s）' % TMP_DIR)
+    return 1 if fails else 0
+
+
+if __name__ == '__main__':
+    sys.exit(main())

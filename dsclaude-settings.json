@@ -1,0 +1,11 @@
+{
+  "_说明": "让 Claude Code 走本地 shim（DeepSeek 网页版，免费）而不是你的付费中转。",
+  "_用法": "claude --settings \"D:\\创业\\deepseek_ask\\dsclaude-settings.json\" --strict-mcp-config",
+  "_或者": "直接用 dsclaude 命令（PowerShell 函数，会自动拉起 shim）",
+
+  "env": {
+    "ANTHROPIC_BASE_URL": "http://127.0.0.1:8799",
+    "ANTHROPIC_AUTH_TOKEN": "dummy",
+    "ANTHROPIC_MODEL": "deepseek-web"
+  }
+}

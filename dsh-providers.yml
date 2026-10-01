@@ -1,0 +1,44 @@
+# DSH 的模型 provider 配置（patch 层）
+#
+# 用法：
+#   npx @deepseek-ai/dsh --profile web --patch "D:\创业\deepseek_ask\dsh-providers.yml"
+#
+# 或者把内容合并进 ~/.dsh/profiles/web/cordis.patch.yml（那是常驻的用户覆盖层，
+# 而且 patchReload 是 live —— 改完下一次请求就生效，不用重启）。
+#
+# ⚠️ 两个 provider 的能力差别巨大，看下面的注释。
+
+# 新会话默认用哪个模型。必须显式指定 —— 不指定的话 DSH 会用它自己的内置默认，
+# 到底是哪个 provider 不好判断（实测那次 contextWindow 报 1000000，
+# 不是我配的任何一个，说明走了内置默认）。
+- id: agent-default-model
+  config:
+    provider: local-relay
+    model: deepseek-v4-pro
+
+- id: llm-pi-ai
+  config:
+    providers:
+
+      # ── 1. 你的中转：真正的 API，支持工具调用，DSH 靠它才能干活 ──
+      local-relay:
+        displayName: 本地中转 (Anthropic 协议)
+        apiKeyEnv: DSH_RELAY_KEY
+        api: anthropic-messages
+        baseURL: http://127.0.0.1:8787/w/claude
+        models:
+          - id: deepseek-v4-pro
+          - id: deepseek-v4.1-flash-expires-on-0910
+
+      # ── 2. 我们的网页版 API：免费，但【不支持工具调用】 ──
+      #    能用它聊天，但 DSH 的 agent 能力（改文件、跑命令）全部无效 ——
+      #    实测发过去带 tools 的请求，返回里根本没有 tool_calls，
+      #    模型自己还说「我无法访问你的文件系统」。
+      #    留着是为了让你能亲眼对比。
+      web-scraped:
+        displayName: DeepSeek 网页版 (免费·无工具)
+        apiKeyEnv: DSH_DUMMY_KEY
+        api: openai-completions
+        baseURL: http://127.0.0.1:8899/v1
+        models:
+          - id: deepseek-web

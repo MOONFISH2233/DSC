@@ -1,0 +1,23 @@
+# ── 运行时产物 ──
+logs/
+locks/
+history/
+_attachments/
+__pycache__/
+*.pyc
+
+# ── 浏览器 profile（体积大，且是本地状态）──
+.browser_profile/
+browser_profile/
+
+# ── 临时/自检残留 ──
+_e2e_tmp/
+*.bak
+
+# ── 恢复过程中的中间文件（保留 DEVLOG.md 本身）──
+DEVLOG.md.broken
+_recovered_broken.md
+_recovered_devlog.md
+
+# 注意：_recovered_full.md 和 _recover_devlog.py **不排除** ——
+# 它们是这次事故的恢复工具和证据，值得进版本库。
