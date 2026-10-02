@@ -191,6 +191,17 @@ BUSY_MIN_CHARS = 10
 # 续写的最大次数 —— 防止按钮不消失时无限循环。
 MAX_CONTINUES = 6
 
+# 点「继续生成」的容错参数。
+#
+# ★ 为什么要重试：实测点击会**偶发**抛「该元素没有位置及大小」（React 重渲染的
+#   瞬时抖动），也可能「点在空气上但 click() 不报错」（项目自己的坑 1）。
+#   早先一次失败就认输 → 半截回答被当成完整回答交出去 → 上游报「缺 content」。
+#
+# 预算：CONTINUE_WAIT × CONTINUE_CLICK_TRIES = 90 秒，和早先单次等待一样长 ——
+#       只是把「一次机会」换成了「两次机会」。
+CONTINUE_WAIT = 45.0          # 点完等多久算「没反应」
+CONTINUE_CLICK_TRIES = 2      # 每次续写最多点几遍
+
 # 结果清洗：只删行首的思考标题行。绝不做「整块删除」—— 思考块边界不可靠，
 # 删多了会连正文一起吃掉。主路径靠抓 .ds-markdown（思考块是它的兄弟节点）天然排除。
 THINK_HEADER_RE = re.compile(
@@ -664,25 +675,83 @@ def find_server_busy(page):
     return None
 
 
-def find_continue_button(page):
+def find_continue_buttons(page):
     """
-    找「继续生成」按钮 —— 回答被长度限制截断时它会出现在回答下方。
+    找「继续生成」按钮的**所有候选**，越像真按钮的越靠前。
 
-    页面上有三层嵌套容器都含这段文字（外层 div → 中层 div → 真正的按钮），
-    所以挑**带 ds-button 类**的那个点，免得点在外层容器上没反应。
+    ★ 实测页面结构（2026-10-03 拿真实的截断回答量的）：
+        <div class="ds-button ds-button--outlinedNeutral ...">   ← 真按钮，React 的 onClick 在这
+          <span class="ds-button__content">继续生成</span>        ← 文字
+    而 `text:继续生成` 只会命中**里层那个 span**。早先的代码按「class 里有
+    ds-button」筛 —— span 的 `ds-button__content` **也含这个子串**，所以它拿到的
+    其实一直是 span。（点 span 能用，事件会冒泡到父 div；但多留几个候选更稳。）
+
+    ★ 排序：带 `ds-button ` / `ds-button--` 的（真按钮）排前面，`ds-button__`
+    这种 BEM 元素（子元素）排后面。
     """
+    out = []
     try:
         for ele in page.eles(SEL['continue_button'], timeout=0.3):
-            cls = ele.attr('class') or ''
-            if 'ds-button' in cls:
-                try:
-                    if ele.states.is_displayed:
-                        return ele
-                except Exception:
-                    return ele
+            try:
+                cls = ele.attr('class') or ''
+            except Exception:
+                continue
+            if 'ds-button' not in cls:
+                continue
+            try:
+                if not ele.states.is_displayed:
+                    continue
+            except Exception:
+                pass
+            # 真按钮 vs BEM 子元素（__content 这种）
+            out.append((0 if '__' not in cls else 1, ele))
     except Exception:
         pass
-    return None
+    out.sort(key=lambda x: x[0])
+    return [e for _, e in out]
+
+
+def find_continue_button(page):
+    """第一个候选。保留这个名字是给自测和旧调用用的。"""
+    btns = find_continue_buttons(page)
+    return btns[0] if btns else None
+
+
+def click_continue(page, tries=CONTINUE_CLICK_TRIES):
+    """
+    点「继续生成」。点上了返回 True，几种方式都点不上返回 False。
+
+    ★ 为什么不能「抓个引用直接 click()，抛异常就算了」：
+      实测真实报错是 DrissionPage 的 **「该元素没有位置及大小」** ——
+      React 重渲染把节点换掉、或那一瞬间还没布局。**这是一次性抖动，不是「点不了」。**
+      早先一次失败就认输 → 半截回答被当成完整回答交出去 → 上游报「缺 content」。
+    ★ 还有更阴的一种：**点在空气上但 click() 不报错**（项目自己的坑 1）。
+      那种只有「点完没反应」才知道 —— 所以调用方把「没反应」也当成失败重试。
+    ★ 每次都重新抓元素：React 每次重渲染都换 DOM 节点，引用绝不能缓存。
+    ★ JS 触发（by_js=True）不需要坐标，专治「没有位置及大小」。
+    """
+    last = ''
+    for i in range(1, tries + 1):
+        for ele in find_continue_buttons(page):
+            try:
+                ele.scroll.to_see()          # 真实点击更接近人的行为
+            except Exception:
+                pass
+            # 第一遍先试真实点击（更像人），之后再试就直接上 JS —— 因为
+            # 「重试」这个动作本身就说明上一次（多半是真实点击）没生效。
+            for by_js in ((False, True) if i == 1 else (True, False)):
+                try:
+                    ele.click(by_js=by_js)
+                    if i > 1 or by_js:
+                        log(f'[续写] 点击成功（第 {i} 次尝试'
+                            f'{"，改用了 JS 触发" if by_js else ""}）')
+                    return True
+                except Exception as e:
+                    last = str(e).replace('\n', ' ')[:60]
+        if i < tries:
+            time.sleep(0.8)
+    log(f'[续写] {tries} 次都没点上（{last}）')
+    return False
 
 
 def answer_done_rendered(page):
@@ -1074,13 +1143,8 @@ def wait_answer(page, baseline, think, start_limit=None, total_limit=None,
         btn = find_continue_button(page)
         if btn and continues < MAX_CONTINUES:
             continues += 1
-            log(f'[续写] 回答被截断了，点「继续生成」（第 {continues} 次）')
             before = txt
-            try:
-                btn.click()
-            except Exception as e:
-                log(f'[续写] 点不动（{str(e)[:50]}），按已完成处理')
-                return txt, None
+            log(f'[续写] 回答被截断了，点「继续生成」（第 {continues} 次）')
 
             # ★ 点完之后**必须等新内容真的开始出来**，不能直接回到「文本不变
             #   就是写完了」那套判据。
@@ -1093,20 +1157,31 @@ def wait_answer(page, baseline, think, start_limit=None, total_limit=None,
             #   后果不只是慢 —— 最后拿到的半截工具调用被当成完整的交给上游，
             #   报 "Error writing file"（content 是空的）。
             #
-            #   判据与阶段 1 一致：文本必须**变得和点击前不一样**才算续上了；
-            #   这一步等不到就认输返回，不再空点。
-            wait_start = time.time()
+            #   判据与阶段 1 一致：文本必须**变得和点击前不一样**才算续上了。
+            #
+            # ★ 再套一层重试：「点了但没反应」也算失败，换种方式再点一次。
+            #   实测点击有两种坏法 —— 抛「该元素没有位置及大小」（React 重渲染
+            #   的瞬时抖动），以及**点在空气上却不报错**（坑 1）。
+            #   早先两者都是直接认输 → 半截回答当完整回答交出去 → 上游报
+            #   「缺 content」。最坏总耗时和早先一样（CONTINUE_WAIT × TRIES）。
             restarted = False
-            while time.time() - wait_start < start_limit:
-                time.sleep(POLL)
-                new_txt = last_answer_text(page)
-                if new_txt and new_txt != before:
-                    restarted = True
-                    last_text, last_change = new_txt, time.time()
+            for attempt in range(1, CONTINUE_CLICK_TRIES + 1):
+                if not click_continue(page):
                     break
+                wait_start = time.time()
+                while time.time() - wait_start < CONTINUE_WAIT:
+                    time.sleep(POLL)
+                    new_txt = last_answer_text(page)
+                    if new_txt and new_txt != before:
+                        restarted = True
+                        last_text, last_change = new_txt, time.time()
+                        break
+                if restarted:
+                    break
+                log(f'[续写] 第 {attempt} 次点完 {int(CONTINUE_WAIT)} 秒没动静，'
+                    f'换种方式再点')
             if not restarted:
-                log(f'[续写] 第 {continues} 次点完 {int(start_limit)} 秒内没有新内容，'
-                    f'按已完成处理')
+                log(f'[续写] 第 {continues} 次没续上，按已完成处理')
                 return txt, None
             continue
 

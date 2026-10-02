@@ -800,7 +800,7 @@ def test_unit():
     #   两次点击的间隔就必须 ≥ 这个延迟。旧代码会在 0.2 秒内就点第二次。
     import deepseek_ask as dsc
     _saved = (dsc.last_answer_text, dsc.answer_done_rendered, dsc.find_continue_button,
-              dsc.STABLE_NORMAL, dsc.POLL, dsc.MAX_CONTINUES)
+              dsc.click_continue, dsc.STABLE_NORMAL, dsc.POLL, dsc.MAX_CONTINUES)
     GEN_DELAY = 0.6                 # 模拟「点完 0.6 秒后新内容才出现」
     st = {'text': 'X' * 200, 'clicks': [], 'append_at': None}
 
@@ -815,10 +815,14 @@ def test_unit():
             st['clicks'].append(time.time())
             st['append_at'] = time.time() + GEN_DELAY
 
+    _btn = _Btn()
     try:
         dsc.last_answer_text = _fake_text
         dsc.answer_done_rendered = lambda _p: True
-        dsc.find_continue_button = lambda _p: _Btn()
+        dsc.find_continue_button = lambda _p: _btn
+        # ★ 实际点击走的是 click_continue（它内部会重抓元素、退化到 JS 点击），
+        #   所以要连它一起换掉 —— 只换 find_continue_button 的话点不到假按钮。
+        dsc.click_continue = lambda _p, *_a, **_k: (_btn.click(), True)[1]
         dsc.STABLE_NORMAL = 0.2
         dsc.POLL = 0.05
         dsc.MAX_CONTINUES = 2
@@ -834,7 +838,50 @@ def test_unit():
               err is None and 'Y' * 50 in (txt or ''), f'{err} / {len(txt or "")} 字')
     finally:
         (dsc.last_answer_text, dsc.answer_done_rendered, dsc.find_continue_button,
-         dsc.STABLE_NORMAL, dsc.POLL, dsc.MAX_CONTINUES) = _saved
+         dsc.click_continue, dsc.STABLE_NORMAL, dsc.POLL, dsc.MAX_CONTINUES) = _saved
+
+    # ★ 回归（真实会话）：第一次点击**点了没反应**时，必须换种方式再点，
+    #   不能一次就认输。实测真实报错是 DrissionPage 的「该元素没有位置及大小」
+    #   （React 重渲染的瞬时抖动）；更阴的一种是**点在空气上而 click() 不报错**
+    #   （项目自己的坑 1）—— 那种只有等一等才知道没生效。
+    #   早先两者都是直接 return，把半截回答当完整回答交出去 → 上游报「缺 content」。
+    _saved_c = (dsc.last_answer_text, dsc.answer_done_rendered, dsc.find_continue_button,
+                dsc.click_continue, dsc.STABLE_NORMAL, dsc.POLL, dsc.MAX_CONTINUES,
+                dsc.CONTINUE_WAIT, dsc.CONTINUE_CLICK_TRIES)
+    st2 = {'text': 'X' * 200, 'clicks': 0, 'append_at': None}
+    try:
+        def _fake_text2(_page):
+            if st2['append_at'] is not None and time.time() >= st2['append_at']:
+                st2['text'] += 'Y' * 50
+                st2['append_at'] = None
+            return st2['text']
+
+        def _fake_click2(_page, *_a, **_k):
+            st2['clicks'] += 1
+            if st2['clicks'] >= 2:          # 第一次没反应，第二次才生效
+                st2['append_at'] = time.time() + 0.3
+            return True
+
+        dsc.last_answer_text = _fake_text2
+        dsc.answer_done_rendered = lambda _p: True
+        dsc.find_continue_button = lambda _p: object()
+        dsc.click_continue = _fake_click2
+        dsc.STABLE_NORMAL = 0.2
+        dsc.POLL = 0.05
+        dsc.MAX_CONTINUES = 1
+        dsc.CONTINUE_WAIT = 0.6          # 缩短，免得用例真跑 45 秒
+        dsc.CONTINUE_CLICK_TRIES = 3
+        txt2c, err2c = dsc.wait_answer(object(), '', False,
+                                       start_limit=5.0, total_limit=20.0)
+        check('★ 点了没反应 → 会换种方式再点（不能一次就认输）',
+              st2['clicks'] >= 2, f'只点了 {st2["clicks"]} 次')
+        check('★ 第二次点上了，续写内容保住',
+              err2c is None and 'Y' * 50 in (txt2c or ''),
+              f'{err2c} / {len(txt2c or "")} 字')
+    finally:
+        (dsc.last_answer_text, dsc.answer_done_rendered, dsc.find_continue_button,
+         dsc.click_continue, dsc.STABLE_NORMAL, dsc.POLL, dsc.MAX_CONTINUES,
+         dsc.CONTINUE_WAIT, dsc.CONTINUE_CLICK_TRIES) = _saved_c
 
     section('单元 · 服务器繁忙不能当回答')
     # ★ 回归：服务端限流时页面弹「服务器繁忙，请稍后重试」，这一轮**根本没生成出
