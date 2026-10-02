@@ -310,6 +310,9 @@ TOOL_GUIDANCE = """
 
 ★ **三步以上的活，先 `TodoWrite` 列个清单，之后每完成一步更新一次。**
   这既是给用户看的进度，也是给你自己记的账 —— 长任务里你很容易忘了还剩哪几件。
+
+★ **工具名必须和「可用工具」清单里的一字不差。** 尤其注意：这台机器上跑命令的
+  工具叫 `PowerShell`，**不叫 `Bash`**。名字写错那个调用会被直接丢弃，整轮白费。
 """
 
 
@@ -967,6 +970,35 @@ def looks_broken(raw):
             or ('"name"' in t and ('"input"' in t or '"arguments"' in t)))
 
 
+# 模型（尤其 Claude 系）习惯把「跑命令」那个工具叫 `Bash` —— 它的训练里就是这名字。
+# 而 Windows 上 Claude Code 给的工具叫 `PowerShell`。
+#
+# ★ 实测：它写出来的命令**已经是 PowerShell 语法**了
+#   （Get-Location / Write-Output / [System.IO.Ports.SerialPort]::GetPortNames()），
+#   唯独名字写成 Bash。直接改名就对了，比让它重发一轮省一整个来回。
+# ★ 万一它真写的是 bash 命令，PowerShell 会报错，它看到错误自然会改 —— 不会更糟。
+# ★ 只在「别名可用、原名确实不可用」时才改：两个都在就尊重模型的选择。
+TOOL_ALIASES = {'Bash': 'PowerShell'}
+
+
+def apply_tool_aliases(parsed, tools):
+    """把模型叫错名字的工具改对。返回新的 parsed（没改就是原样）。"""
+    if parsed[0] != 'tools':
+        return parsed
+    valid = {t.get('name') for t in tools}
+    out, changed = [], []
+    for t in parsed[1]:
+        alias = TOOL_ALIASES.get(t.get('name'))
+        if alias and alias in valid and t.get('name') not in valid:
+            changed.append('%s→%s' % (t['name'], alias))
+            t = dict(t, name=alias)
+        out.append(t)
+    if changed:
+        ds.log(f'[提示] 工具名认错了，自动改名：{"、".join(changed)}')
+        return ('tools', out, parsed[2])
+    return parsed
+
+
 def should_retry(parsed, tools):
     """
     这次回复该不该「重问一遍」。
@@ -1030,6 +1062,21 @@ def retry_reason(parsed, tools):
 
     if not tools or parsed[0] != 'tools':
         return None
+
+    # ★ 工具名全都不存在 —— 模型编了个名字。**绝不能回一句「请换个方式提问」
+    #   当回答**：那是**助手消息**，Claude Code 收到就认为这一轮说完了、直接结束，
+    #   用户只能手打「继续」。实测踩过：模型写对了 PowerShell 命令，只是名字叫成了
+    #   Bash，整个会话就停在那儿，整轮白费。
+    #   交给重试，把真实可用的名字告诉它。
+    #   （部分名字错的情况不在这儿管 —— 那由调用方过滤掉坏的、留下好的。）
+    valid = {t.get('name') for t in tools}
+    bogus = [t['name'] for t in parsed[1] if t['name'] not in valid]
+    if len(bogus) == len(parsed[1]):
+        return ('你调用的工具名不存在：%s。\n'
+                '**这次真正可用的工具名**（拼写和大小写都要一致）：%s\n'
+                '请用上面某一个名字，把刚才那个调用原样重发一次。'
+                % (bogus, '、'.join(sorted(valid)[:25])))
+
     bad = incomplete_tool(parsed[1])
     if not bad:
         return None
@@ -1458,7 +1505,9 @@ class Handler(BaseHTTPRequestHandler):
                 }
                 save_sessions(sessions)
 
-        parsed = parse_reply(raw)
+        # 模型把工具名认错了（比如把 PowerShell 叫成 Bash）→ **先改名再往下走**，
+        # 这样重试判据和长字段检查看到的都是正确的名字。
+        parsed = apply_tool_aliases(parse_reply(raw), tools)
 
         # 这条回复有没有「不能就这么发上去」的毛病 → 有就重问。
         # 两类毛病（JSON 写坏了 / 工具调用缺长字段）见 retry_reason()。
@@ -1564,6 +1613,10 @@ class Handler(BaseHTTPRequestHandler):
         # 直接透给 Claude Code 会变成「未知工具」报错，还不如当普通回答。
         # 注意不要写成 `if tools and ...` —— tools 为空时模型照样会编，
         # 那种情况 valid 是空集，任何名字都不合法，正好该被拦下。
+        #
+        # ★ 「名字**全**错」的情况其实到不了这里 —— retry_reason 已经把它拦去
+        #   重试了（那里能把真实可用的名字告诉模型）。下面 else 那个「当普通回答」
+        #   只是最后一道保险：它产出的是**助手消息**，Claude Code 收到就结束这一轮。
         if parsed[0] == 'tools':
             valid = {t.get('name') for t in tools}
             good = [t for t in parsed[1] if t['name'] in valid]

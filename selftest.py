@@ -437,6 +437,36 @@ def test_unit():
     check('★ delta 路径也带压缩版引导（否则第二轮起就忘光）',
           'AskUserQuestion' in _d and '不要再调工具' not in _d, _d[:80])
 
+    section('单元 · 工具名认错（Bash → PowerShell）')
+    # ★ 回归（真实使用实测）：模型写对了 PowerShell 命令，**唯独名字叫成了 Bash**
+    #   （它的训练里「跑命令」就叫 Bash）。旧代码把这种回复换成一句
+    #   「请换个方式提问」当**回答** —— 那是助手消息，Claude Code 收到就结束这一轮，
+    #   用户只能手打「继续」，整轮白费。
+    PS_ONLY = [{'name': 'PowerShell', 'input_schema': {}},
+               {'name': 'Read', 'input_schema': {}}]
+    _p = cs.parse_reply('{"tool_use": {"name": "Bash", "input": {"command": "Get-Location"}}}')
+    _a = cs.apply_tool_aliases(_p, PS_ONLY)
+    check('★ Bash 会被自动改名成 PowerShell',
+          _a[1][0]['name'] == 'PowerShell' and _a[1][0]['input'] == {'command': 'Get-Location'},
+          str(_a[1])[:120])
+    # 两个都在 → 尊重模型的选择，别乱改
+    _both = cs.apply_tool_aliases(_p, [{'name': 'Bash', 'input_schema': {}}] + PS_ONLY)
+    check('Bash 本身可用时不改名', _both[1][0]['name'] == 'Bash')
+    # PowerShell 不在可用列表里 → 没得改
+    _no = cs.apply_tool_aliases(_p, [{'name': 'Read', 'input_schema': {}}])
+    check('没有 PowerShell 可改时保持原样', _no[1][0]['name'] == 'Bash')
+    check('普通回答不受影响',
+          cs.apply_tool_aliases(('reply', '你好', ''), PS_ONLY)[0] == 'reply')
+
+    check('★ 名字全错时要走重试，而不是回一句「请换个方式提问」',
+          (cs.retry_reason(_p, PS_ONLY) or '').find('PowerShell') >= 0,
+          repr(cs.retry_reason(_p, PS_ONLY))[:100])
+    # 部分名字错的情况不归 retry_reason 管（调用方会过滤掉坏的、留住好的）
+    _mix = ('tools', [{'name': 'Bash', 'input': {'command': 'x'}},
+                      {'name': 'Read', 'input': {'file_path': 'a'}}], '')
+    check('部分名字错时不触发重试（过滤器会留住好的那个）',
+          cs.retry_reason(_mix, PS_ONLY) is None)
+
     section('单元 · Windows 路径转义')
     # ★ 回归：模型写路径时几乎从不转义，而 JSON 里 \b \f \n \r \t \u 都是
     #   **合法转义** —— 于是路径被静默吃掉：
