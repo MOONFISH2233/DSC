@@ -359,6 +359,22 @@ def test_unit():
     check('★ 普通工具仍然截到 400 字（防止提示词悄悄膨胀）',
           'X' * 400 in rn and 'X' * 401 not in rn)
 
+    # ★ 回归：引导必须**真的进到**提示词里。
+    #   早先的截断逻辑写死 `parts[:3]`，往工具清单后面加一段，正好会被切掉 ——
+    #   而且不报错、日志干净、测试全绿（这类静默失效最危险）。
+    #   现在改成用 len() 记账，这条用例就是那个的守门员。
+    _t = [{'name': 'Read', 'description': '读文件', 'input_schema': {}}]
+    _msgs = [{'role': 'user', 'content': '你好'}]
+    check('★ 交互类工具的引导进得了提示词（build_prompt）',
+          'AskUserQuestion' in cs.build_prompt('你是助手', _msgs, _t)
+          and 'EnterPlanMode' in cs.build_prompt('你是助手', _msgs, _t))
+    check('没有工具时全程不提这些工具（免得模型凭空编）',
+          'AskUserQuestion' not in cs.build_prompt('你是助手', _msgs, []))
+    # delta 是**每轮**都走的路径，规则只在第一轮出现的话，模型第二轮就忘光了
+    _d = cs.build_delta_prompt(_msgs)
+    check('★ delta 路径也带压缩版引导（否则第二轮起就忘光）',
+          'AskUserQuestion' in _d and '不要再调工具' not in _d, _d[:80])
+
     section('单元 · Windows 路径转义')
     # ★ 回归：模型写路径时几乎从不转义，而 JSON 里 \b \f \n \r \t \u 都是
     #   **合法转义** —— 于是路径被静默吃掉：
