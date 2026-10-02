@@ -148,7 +148,12 @@ OUTPUT_RULES = """
 **情况一：需要调用工具**
 
 **先用一句话说明你接下来要干什么**（不超过 100 字，就像跟人说话那样，
-比如「先看看目录里有什么」「这三处我一起改掉」），**然后另起一段**输出 JSON：
+比如「先看看目录里有什么」「这三处我一起改掉」），**然后另起一段**输出 JSON。
+
+★ **JSON 不要包在 markdown 代码块里** —— 不要 ```json、不要 ```，直接写 `{`。
+  包了围栏，我们会把**围栏里那坨 JSON 本身**当成「你要写的内容」挂到工具参数上，
+  结果是给工具塞一个它根本没有的参数，上游直接报「参数非法」，整轮白费。
+  （实测踩过：模型给 Read 调用加了围栏，被塞进一个 `content` 参数。）
 
   一个工具： {"tool_use": {"name": "<工具名>", "input": {<参数>}}}
 
@@ -630,6 +635,9 @@ _BLOCK_FIELD = {
     'PowerShell': 'command',
     'Edit': 'new_string',
     'NotebookEdit': 'new_source',
+    # 子代理的长字段叫 prompt（不叫 content）—— 漏了它的后果见上面
+    # 「不认识的工具什么都不填」那段注释。
+    'Task': 'prompt',
 }
 
 
@@ -647,7 +655,10 @@ def _attach_code_block(text, tools):
     """
     if not tools:
         return tools
-    m = _CODE_BLOCK_RE.search(text)
+    # ★ 先把工具调用那段 JSON（连同包着它的围栏）切掉，再找内容块 —— 见
+    #   _remove_tool_call_span 的说明。不切的话，贪婪的代码块正则会从
+    #   「包 JSON 的那个围栏」一路吃到「内容那个围栏」，把 JSON 也当成内容。
+    m = _CODE_BLOCK_RE.search(_remove_tool_call_span(text))
     if not m:
         return tools
     body = m.group(1)
@@ -657,18 +668,99 @@ def _attach_code_block(text, tools):
         t = dict(t)
         inp = dict(t.get('input') or {})
         field = _BLOCK_FIELD.get(t.get('name'))
-        if field is not None:
-            if not inp.get(field):
-                inp[field] = body
-        else:
-            # 不认识的工具：填第一个空的「文本类」字段
-            for k in ('content', 'command', 'new_string', 'text'):
-                if not inp.get(k):
-                    inp[k] = body
-                    break
+        if field is None:
+            # ★ 不认识的工具**什么都不填**。
+            #   早先这里会「填第一个空的文本类字段」—— 那是瞎猜，而且猜错是
+            #   **必然**被上游拒（参数非法，红的），比不填还糟：
+            #     Read 没有 content、WebFetch 没有 command、
+            #     Task 的长字段叫 prompt 不叫 content。
+            #   要支持新工具就往 _BLOCK_FIELD 里加一条，别让它猜。
+            out.append(t)
+            continue
+        if not inp.get(field):
+            inp[field] = body
         t['input'] = inp
         out.append(t)
     return out
+
+
+# 紧挨在工具调用 JSON 前后的围栏。模型有时会写成：
+#
+#     我这就写。
+#     ```json
+#     {"tool_use": {"name": "Write", "input": {"file_path": "..."}}}
+#     ```
+#     ```python
+#     ...真正的文件内容（几千字）...
+#     ```
+#
+# 中间的 ```json 是**包 JSON 的**，```python 才是内容开头。要能分辨这两者。
+_FENCE_OPEN_BEFORE_RE = re.compile(r'```[a-zA-Z0-9_+\-]*[ \t]*\r?\n[ \t]*$')
+_FENCE_CLOSE_AFTER_RE = re.compile(r'^[ \t]*\r?\n?[ \t]*```[ \t]*(?:\r?\n|$)')
+
+
+def _remove_tool_call_span(text):
+    """
+    把工具调用那段 JSON（连同包着它的围栏）从文本里切掉，返回剩下的文本。
+
+    ★ 为什么必须切：抓代码块的正则是**贪婪**的 —— 而且必须贪婪，否则
+      「文件内容里自带围栏」时会被静默截断（那个坑踩过，代价是文件少一大半）。
+      可贪婪一旦碰上「模型给 JSON 也加了围栏」，就会从**第一个** ``` 一路吃到
+      **最后一个** ```，把 JSON 和围栏一起圈成「文件内容」。
+
+      后果分两种，都不好：
+        · 不拦 → **静默写出一份带 JSON 和围栏的垃圾文件**（数据损坏，最危险的一类）
+        · 拦 → 白重试一轮（实测 e2e 就是这么红的）
+      切开之后，贪婪正则只在自己那一块里贪婪，两个问题一起没了。
+    """
+    start = -1
+    for mk in _TOOL_MARKERS:
+        i = text.find(mk)
+        if i >= 0 and (start < 0 or i < start):
+            start = i
+    if start < 0:
+        return text
+
+    # ★ 只有「工具调用确实被围栏包着」时才需要切。判据是**围栏数量的奇偶**：
+    #
+    #     我这就写。          ← 1 个围栏（奇数）→ 最后那个是「还没闭合的开头」
+    #     ```json                → JSON 被包着，必须切
+    #     {"tool_use": ...}
+    #
+    #     我这就写。          ← 2 个围栏（偶数）→ 最后那个只是**收尾**
+    #     ```python              → JSON 没被包，后面/前面那个围栏是内容自己的
+    #     <内容>                   一个字符都不能动，动了内容就丢
+    #     ```
+    #     {"tool_use": ...}
+    #
+    #   ★ 光看「紧邻的是不是 ```」分不出来 —— 包 JSON 的开头围栏和前一个
+    #     内容块的收尾围栏**长得一模一样**。我第一版就是这么写错的，
+    #     后果是**把已经拿到手的内容整段切掉**（静默丢数据，最危险的一类）。
+    head_text = text[:start]
+    if head_text.count('```') % 2 == 0:
+        return text
+    fm = _FENCE_OPEN_BEFORE_RE.search(head_text)
+    if not fm:
+        return text
+
+    depth, end = 0, -1
+    for i in range(start, len(text)):
+        c = text[i]
+        if c == '{':
+            depth += 1
+        elif c == '}':
+            depth -= 1
+            if depth == 0:
+                end = i + 1
+                break
+    if end < 0:
+        # 括号没配平 = 被截断的 JSON。那不是「完整的调用 + 后面的内容」，
+        # 别乱切，交给重试路径去处理。
+        return text
+
+    head = text[:fm.start()]
+    tail = _FENCE_CLOSE_AFTER_RE.sub('', text[end:], count=1)
+    return head + tail
 
 
 def _looks_like_call(obj):
@@ -795,8 +887,10 @@ def parse_reply(raw):
     embedded, idx = _extract_embedded_tools(t)
     if embedded:
         ds.log(f'[提示] 模型在 {len(t)} 字的说明里夹带了 {len(embedded)} 个工具调用，已抠出来')
-        # idx 之前那段就是叙述 —— 这就是用户要看的「中间文字」
-        prose = t[:idx].strip()[:MAX_PROSE_CHARS]
+        # idx 之前那段就是叙述 —— 这就是用户要看的「中间文字」。
+        # 末尾可能挂着个围栏开头（模型爱先写说明、再开一个 json 围栏包住 JSON），
+        # 剥掉 —— 否则用户会看到一句以围栏结尾的怪话。
+        prose = re.sub(r'```[a-zA-Z0-9_+\-]*\s*$', '', t[:idx]).strip()[:MAX_PROSE_CHARS]
         # ★ 这里也要补代码块 —— 「JSON + 后面跟代码块」走的正是这条路
         #   （整段不以 } 结尾，所以进不了上面那个分支）。漏了的话长内容就丢了。
         return ('tools', _attach_code_block(t, embedded), prose)
@@ -1385,6 +1479,13 @@ class Handler(BaseHTTPRequestHandler):
                        '重新问一次'
                        % (attempt, MAX_RETRIES, _bad.get('name'),
                           _BLOCK_FIELD.get(_bad.get('name'))))
+                # ★ 光记「缺 content」是查不出原因的 —— 到底是「回复被网页截断了」
+                #   还是「我们把内容挂错了地方」，两者的现象一模一样。
+                #   把原文的头尾和围栏数量记下来，一眼就能分辨：
+                #     结尾没有闭合围栏 + 括号不配平 → 网页截断（真的没写完）
+                #     围栏数量不对            → 是我们切错了（见 _remove_tool_call_span）
+                ds.log('[重试] 原始回复 %d 字 · 围栏 %d 个 · 头 %r · 尾 %r'
+                       % (len(raw), raw.count('```'), raw[:90], raw[-90:]))
             else:
                 ds.log('[重试] 第 %d/%d 次：输出像是坏掉的工具调用，重新问一次'
                        % (attempt, MAX_RETRIES))

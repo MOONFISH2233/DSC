@@ -265,6 +265,68 @@ def test_unit():
     check('★ 它必须被认成坏输出并触发重试（不能当正经回答放行）',
           cs.looks_broken(JUNK) and cs.should_retry(pj, PS))
 
+    # ★ 回归（实测翻车，用户看到的是红色的 "Invalid tool parameters"）：
+    #   模型把工具调用的 JSON **包进 ```json 围栏**时，_attach_code_block 的正则
+    #   会把**那坨 JSON 本身**当成「要写的内容」，挂到工具参数上 ——
+    #   给 Read 塞一个它根本没有的 `content` 字段，上游直接拒。
+    #   根因是提示词漏了「不要 markdown 代码块」那句（加叙述规则时删掉的），
+    #   但解析层也必须挡得住 —— 提示词是说服，不是保证。
+    fenced = ('我先读一下这个文件。\n\n```json\n'
+              '{"tool_use": {"name": "Read", "input": {"file_path": "D:' + B + 'a.py"}}}\n```')
+    rf = cs.parse_reply(fenced)
+    check('★ 围栏包着工具调用时，不能把那坨 JSON 当成参数塞进去',
+          rf[0] == 'tools' and set(rf[1][0]['input']) == {'file_path'},
+          str(rf[1][0]['input'])[:140])
+    check('★ 叙述末尾的围栏被剥掉（不能给用户看一句半截围栏）',
+          rf[2] == '我先读一下这个文件。', repr(rf[2]))
+
+    # 不认识的工具 + 代码块 → **什么都不填**。瞎猜字段名必然参数非法，比不填还糟。
+    ru = cs.parse_reply('{"tool_use": {"name": "SomeUnknownTool", "input": {"a": 1}}}'
+                        '\n```\n随便什么\n```')
+    check('★ 不认识的工具不瞎填字段（猜错必然被上游拒）',
+          set(ru[1][0]['input']) == {'a'}, str(ru[1][0]['input'])[:140])
+
+    # 子代理的长字段叫 prompt，不叫 content —— 漏了它会掉进上面那条瞎猜
+    rt = cs.parse_reply('{"tool_use": {"name": "Task", "input": {"description": "查"}}}'
+                        '\n```\n去查一下 X\n```')
+    check('Task 的长字段 prompt 能走代码块补上',
+          (rt[1][0]['input'].get('prompt') or '').strip() == '去查一下 X',
+          str(rt[1][0]['input'])[:140])
+
+    # ★ 回归（e2e 实测红的）：**两个围栏** —— 第一个包 JSON，第二个才是内容。
+    #   抓代码块的正则是贪婪的（必须贪婪），于是它会从第一个 ``` 一路吃到最后一个，
+    #   把 JSON 和围栏一起圈成「文件内容」。不拦就是**静默写出垃圾文件**，
+    #   拦了就是白重试（e2e 那次就是这么红的）。正确做法是先切掉 JSON 那段。
+    two = ('我这就写。\n\n```json\n'
+           '{"tool_use": {"name": "Write", "input": {"file_path": "D:' + B + 'a.py"}}}\n'
+           '```\n```python\n'
+           'print("hello")\n'
+           'print("world")\n'
+           '```')
+    r2f = cs.parse_reply(two)
+    check('★ 两个围栏（包 JSON 的 + 真内容的）→ 内容块要取对',
+          r2f[0] == 'tools'
+          and (r2f[1][0]['input'].get('content') or '').strip()
+              == 'print("hello")\nprint("world")',
+          repr(r2f[1][0]['input'].get('content'))[:140])
+    check('★ 两围栏时叙述也不能带上 JSON 那段',
+          r2f[2] == '我这就写。', repr(r2f[2]))
+
+    # ★ 回归：**内容块在前、工具调用在后**。这时 JSON 前面紧挨着的那个 ```
+    #   是**内容块的收尾围栏**，不是「包 JSON 的开头围栏」—— 两者长得一模一样。
+    #   第一版靠「紧邻的是不是 ```」判断，于是把已经拿到手的内容**整段切掉**，
+    #   表现成「Write 缺 content」（静默丢数据）。判据必须是围栏数量的奇偶。
+    rev = ('我这就写。\n```python\n'
+           'print("hello")\nprint("world")\n'
+           '```\n'
+           '{"tool_use": {"name": "Write", "input": {"file_path": "D:' + B + 'a.py"}}}')
+    rrev = cs.parse_reply(rev)
+    check('★ 内容块在前、JSON 在后 → 内容不能被切掉',
+          rrev[0] == 'tools'
+          and (rrev[1][0]['input'].get('content') or '').strip()
+              == 'print("hello")\nprint("world")',
+          repr(rrev[1][0]['input'].get('content'))[:140])
+
     # 短内容直接写 JSON 的老写法必须继续有效
     r2 = cs.parse_reply('{"tool_use": {"name": "Write", "input": '
                         '{"file_path": "D:' + B + 'a.py", "content": "print(1)"}}}')
