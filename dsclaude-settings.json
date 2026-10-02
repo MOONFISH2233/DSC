@@ -3,6 +3,16 @@
   "_用法": "claude --settings \"D:\\创业\\deepseek_ask\\dsclaude-settings.json\" --strict-mcp-config",
   "_或者": "直接用 dsclaude 命令（PowerShell 函数，会自动拉起 shim）",
 
+  "_skipWebFetchPreflight_说明": [
+    "WebFetch 抓网页前会先向 api.anthropic.com/api/web/domain_info 发一个域名安全校验",
+    "（防提示注入）。这个请求走的是**绝对地址**，不看 ANTHROPIC_BASE_URL —— 所以本地",
+    "shim 既拦不到也绕不过。而本机到 claude.ai / api.anthropic.com 的 HTTPS 全超时",
+    "（TCP 能连上，请求挂死），于是校验必失败，报 「Unable to verify if domain ... is safe」。",
+    "关掉之后 WebFetch 直接用，代价是不再查域名黑名单 —— 个人自用机器上可接受。",
+    "★ 改这个文件后要重启 Claude Code（不是重启 shim）才生效。"
+  ],
+  "skipWebFetchPreflight": true,
+
   "env": {
     "ANTHROPIC_BASE_URL": "http://127.0.0.1:8799",
     "ANTHROPIC_AUTH_TOKEN": "dummy",

@@ -1414,3 +1414,72 @@ parse_reply -> tools
 - **2026-10-03 凌晨** —— 真实使用翻车：叙述改动误删「不要代码块」→ 模型给 JSON
   加围栏 → 内容被当参数塞错字段（`Invalid tool parameters`）；修法两度自伤
   （先误拦、后误切），最终用「围栏数量奇偶」判据定案
+
+---
+
+## 附录：WebFetch 为什么在这台机器上用不了（以及怎么修）
+
+现象（用户在 dsc 里让模型看两个 GitHub 仓库时）：
+
+```
+● Fetch(https://github.com/Roy1118/he-only-ever-read-space)
+  ⎿  Error: Unable to verify if domain github.com is safe to fetch. This may be due to
+     network restrictions or enterprise security policies blocking claude.ai.
+```
+
+**不是 deepseek_ask 的问题，而且换回付费中转也一样。**
+
+### 原因
+
+Claude Code 的 `WebFetch` 抓网页**之前**，会先把目标域名发给 Anthropic 做一次
+安全校验（防提示注入），端点是
+
+```
+https://api.anthropic.com/api/web/domain_info?domain=<域名>
+```
+
+（老版本是 `claude.ai/api/web/domain_info`，错误文案还留着旧措辞，所以消息里写的是 claude.ai。）
+
+**这个请求走的是绝对地址，不看 `ANTHROPIC_BASE_URL`** —— 两条独立证据：
+- 本机 shim 的日志里**从来没出现过**这个请求（只有 `/health`、`/think`、`/search`、`/v1/*`）
+- 拿 github.com（本机 HTTPS 返回 200）去试，一样失败 —— 说明校验跟目标域名通不通无关
+
+而本机到这两个域名的 HTTPS **全部超时**（TCP 443 能连上，请求挂死 —— 和「GitHub HTTPS
+被重置」是同一个现象）：
+
+| 地址 | TCP 443 | HTTPS |
+|---|---|---|
+| claude.ai | 通 | **超时** |
+| api.anthropic.com | 通 | **超时** |
+| github.com | 通 | 200 ✓ |
+
+校验发不出去 → 直接放弃抓取。
+
+### 修法
+
+官方给「到 Anthropic 的流量被挡」的环境留了开关，加进 `dsclaude-settings.json`：
+
+```json
+"skipWebFetchPreflight": true
+```
+
+**实测有效** —— 加完让 dsc 去抓 `https://example.com`，拿到了标题
+`Example Domain`（跳过校验后 WebFetch 真的去抓了）。
+
+- ★ 改完要**重启 Claude Code**（不是重启 shim）—— 设置是启动时读的。
+- 代价：不再查域名黑名单。个人自用机器上可接受；要对外的环境应该配
+  `WebFetch` 权限规则来限制能访问哪些域名。
+- 这个坑**和走不走 shim 无关** —— 想在自己的付费 `claude` 里也用上 WebFetch，
+  得把这一行也加进 `~/.claude/settings.json`。
+
+### 同一个网络还会撞到的其他墙
+
+| 功能 | 走哪儿 | 在这台机器上 |
+|---|---|---|
+| **WebSearch** | **服务端工具**，在 API 请求里执行 → 走 `ANTHROPIC_BASE_URL` | 会打到我们的 shim，而 shim 没实现 `web_search` → 用不了。**这正是 `[[SEARCH]]` 标记要替代的东西** |
+| 自动更新 / 插件市场 | `downloads.claude.ai` / github | 会失败或卡住；`CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1` 可关 |
+| `/login` 和 OAuth 刷新 | claude.ai + platform.claude.com | 连不上 —— 但我们用的是 dummy token，不涉及 |
+
+> **一句话**：这台机器上「凡是 Claude Code 自己要去连 Anthropic 的功能」都会挂，
+> 跟模型后端换没换成 DeepSeek 无关。`[[SEARCH]]` 之所以有价值，就是因为它绕开了
+> 服务端 `WebSearch` 那条路。
