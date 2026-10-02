@@ -616,6 +616,53 @@ _TOOL_MARKERS = ('{"tool_use"', '{ "tool_use"', '{"tool_calls"', '{ "tool_calls"
                  '{"tool_call"')
 
 
+# 「抠夹带工具调用」另用一套 —— 比 _TOOL_MARKERS 多一个**裸写法** `{"name"`。
+#
+# ★ 为什么裸写法只在**这里**放开、不能并进 _TOOL_MARKERS：那一份还兼着
+#   「这段文字像不像在试图调工具」的判断（`looks_broken` 在用），太宽会把正常
+#   回答误判成坏调用、白重试一轮。而这里每一步都有 `_looks_like_call()` 兜底 ——
+#   它要求同时有 name **和字典类型的** input/arguments，正常回答里举的例子
+#   （`{"name": "张三", "age": 18}`）根本过不了，所以是安全的。
+#
+# ★ 实测踩过（用户真实会话）：
+#       我先看一下目录结构。
+#       {"name": "PowerShell", "arguments": {"command": "..."}}
+#   —— **叙述 + 裸写法**。整段既不以 `{` 开头、也没有 tool_use 标记，于是抠不出来、
+#   `looks_broken` 也放行，这坨 JSON 就被当成「回答」交出去 —— Claude Code 没有
+#   工具可调，这一轮直接结束。**这是加了叙述功能之后才出现的新形状**：
+#   两个识别口子原本各自都够用，是「叙述 + 裸写法」把它们之间的缝露出来了。
+_EMBED_MARKERS = _TOOL_MARKERS + ('{"name"', '{ "name"')
+
+_MARKER_RE = re.compile('|'.join(re.escape(m) for m in _EMBED_MARKERS))
+
+
+def _find_tool_call_span(text):
+    """
+    找出第一段**能解析成工具调用**的 JSON，返回 (起, 止) 下标；找不到返回 (-1, -1)。
+
+    ★ 抽出来是因为两处要用同一套逻辑：抠工具调用（`_extract_embedded_tools`）和
+      「切掉工具调用再找内容块」（`_remove_tool_call_span`）。各写一遍迟早不一致。
+    ★ 按**位置**逐个候选试，而不是「每种标记只看第一次出现」—— 早先的写法碰上
+      「正文里先举个 JSON 例子、后面才是真调用」会整个错过。
+    """
+    for m in _MARKER_RE.finditer(text):
+        idx = m.start()
+        depth = 0
+        for i in range(idx, len(text)):
+            c = text[i]
+            if c == '{':
+                depth += 1
+            elif c == '}':
+                depth -= 1
+                if depth == 0:
+                    obj = _loads_lenient(text[idx:i + 1])
+                    # 两道都要过：像调用 + 真能抠出工具来
+                    if _looks_like_call(obj) and _tools_from(obj):
+                        return idx, i + 1
+                    break
+    return -1, -1
+
+
 # 「长内容放代码块」协议用的正则：抓 JSON 后面那个围栏代码块。
 #
 # ★ 必须**贪婪**匹配（吃到最后一个 ```），不能非贪婪。非贪婪会在内容里第一次
@@ -716,12 +763,9 @@ def _remove_tool_call_span(text):
         · 拦 → 白重试一轮（实测 e2e 就是这么红的）
       切开之后，贪婪正则只在自己那一块里贪婪，两个问题一起没了。
     """
-    start = -1
-    for mk in _TOOL_MARKERS:
-        i = text.find(mk)
-        if i >= 0 and (start < 0 or i < start):
-            start = i
+    start, end = _find_tool_call_span(text)
     if start < 0:
+        # 抠不出完整的一段 —— 多半是 JSON 被截断了。交给重试路径处理，别乱切。
         return text
 
     # ★ 只有「工具调用确实被围栏包着」时才需要切。判据是**围栏数量的奇偶**：
@@ -746,21 +790,7 @@ def _remove_tool_call_span(text):
     if not fm:
         return text
 
-    depth, end = 0, -1
-    for i in range(start, len(text)):
-        c = text[i]
-        if c == '{':
-            depth += 1
-        elif c == '}':
-            depth -= 1
-            if depth == 0:
-                end = i + 1
-                break
-    if end < 0:
-        # 括号没配平 = 被截断的 JSON。那不是「完整的调用 + 后面的内容」，
-        # 别乱切，交给重试路径去处理。
-        return text
-
+    # 括号配对交给 _find_tool_call_span 了 —— end 已经是那段 JSON 的结尾
     head = text[:fm.start()]
     tail = _FENCE_CLOSE_AFTER_RE.sub('', text[end:], count=1)
     return head + tail
@@ -804,26 +834,10 @@ def _extract_embedded_tools(text):
     调用方靠它切出前面的说明文字（见 parse_reply 的第三个返回值）。
     没抠出来就是 `([], -1)`。
     """
-    limit = len(text)
-    for marker in _TOOL_MARKERS:
-        idx = text.find(marker)
-        if idx < 0:
-            continue
-        depth = 0
-        for i in range(idx, limit):
-            c = text[i]
-            if c == '{':
-                depth += 1
-            elif c == '}':
-                depth -= 1
-                if depth == 0:
-                    obj = _loads_lenient(text[idx:i + 1])
-                    if _looks_like_call(obj):
-                        tools = _tools_from(obj)
-                        if tools:
-                            return tools, idx
-                    break
-    return [], -1
+    idx, end = _find_tool_call_span(text)
+    if idx < 0:
+        return [], -1
+    return _tools_from(_loads_lenient(text[idx:end])), idx
 
 
 # 夹带叙述的长度上限。提示词里跟模型说的是「不超过 100 字」，但它会飘 ——

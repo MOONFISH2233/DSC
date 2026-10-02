@@ -365,6 +365,33 @@ def test_unit():
           cs.parse_reply('这就是答案。')[0] == 'reply'
           and cs.parse_reply('这就是答案。')[2] == '')
 
+    # ★ 回归（用户真实会话，加叙述之后才出现的新形状）：
+    #   **叙述 + 裸写法**（OpenAI 风格 {"name":..., "arguments":...}，没有 tool_use 外壳）。
+    #   整段既不以 { 开头、也没有 tool_use 标记 → 抠不出来、looks_broken 也放行 →
+    #   这坨 JSON 被当成「回答」交出去，Claude Code 没有工具可调，这一轮就结束。
+    #   两个识别口子原本各自都够用，是「叙述 + 裸写法」把它们中间的缝露出来了。
+    bare = ('我先看一下目录结构。\n\n'
+            '{"name": "PowerShell", "arguments": {"command": "Get-ChildItem"}}')
+    rb = cs.parse_reply(bare)
+    check('★ 叙述 + 裸写法也能抠出来',
+          rb[0] == 'tools' and rb[1][0]['name'] == 'PowerShell'
+          and rb[1][0]['input'].get('command') == 'Get-ChildItem',
+          str(rb)[:140])
+    check('★ 它的叙述也要保留', rb[2] == '我先看一下目录结构。', repr(rb[2]))
+
+    # 反面：正常回答里举例说明 JSON 长什么样，**不能**被当成工具调用
+    example = '举个例子，一个对象可以长这样：{"name": "张三", "age": 18}，就这样。'
+    check('★ 正常回答里举的例子不能被误判成工具调用',
+          cs.parse_reply(example)[0] == 'reply', str(cs.parse_reply(example))[:110])
+
+    # 正文里先举个「像调用但缺参数字典」的例子，后面才是真调用 —— 要跳过前者找到后者
+    mixed = ('格式是这样的：{"name": "x"} 只是个说明。\n'
+             '现在开始：\n'
+             '{"name": "Read", "arguments": {"file_path": "D:' + B + 'a.py"}}')
+    rm = cs.parse_reply(mixed)
+    check('★ 先举例、后真调用 → 要找到真的那个',
+          rm[0] == 'tools' and rm[1][0]['name'] == 'Read', str(rm)[:140])
+
     # 响应混排：text 块必须在 tool_use 块**前面**，且 stop_reason 仍是 tool_use
     # （带工具就要让 Claude Code 继续跑，改成 end_turn 这一轮就结束了）
     m = cs.to_anthropic_tools([{'name': 'Read', 'input': {'file_path': 'a'}}], text='我读一下')
