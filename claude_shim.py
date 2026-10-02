@@ -63,6 +63,15 @@ MAX_HISTORY_MSGS = 24
 # 网页那边有压缩前的完整历史，只要给它最近几条就能接上话。
 REBASE_MSGS = 6
 
+# 模型写出坏工具调用时，最多重问几次（不含第一次）。
+#
+# ★ 为什么要多次：这类毛病**不是偶发**，而是模型写命令时不转义引号这种
+#   系统性习惯 —— 实测同一个错连犯两次。只重试一次的话，第二次撞上同一个
+#   习惯就认输，把 JSON 原文当回答交给 Claude Code，那一轮没有工具可调、
+#   会话就停在提示符上等用户手打「继续」。
+#   每次重试开新对话、带全量上下文，最坏 ~60 秒，所以别调太大。
+MAX_RETRIES = 2
+
 # ── 会话映射表：Claude Code 的 session_id  →  网页对话 ──
 # Claude Code 每个请求都会在 metadata.user_id 里带上自己的 session_id，
 # `claude -r` 恢复会话时这个 id 不变 —— 所以可以把「一个 Claude 会话」和
@@ -145,7 +154,7 @@ OUTPUT_RULES = """
   一张一张来要多花好几倍时间，而且毫无好处：每多一轮就多等十几秒，
   看 20 张图就是 20 轮。一次列全，一轮就能看完。
 
-★ **要放长文本（文件内容、整段代码、长命令）时，不要塞进 JSON 字符串里。**
+★ **要放长文本（文件内容、整段代码、命令）时，不要塞进 JSON 字符串里。**
 
   改成：JSON 里只写其他参数，长文本**原样放在 JSON 后面的代码块里** ——
   这样**一个字符都不用转义**，引号、反斜杠、换行照写：
@@ -157,7 +166,14 @@ OUTPUT_RULES = """
         return "hello"
     ```
 
-  （短参数比如路径、命令还是照常写在 JSON 里。）
+    {"tool_use": {"name": "PowerShell", "input": {"description": "跑一下自测"}}}
+    ```
+    py -3.11 selftest.py --fast 2>&1; Write-Output "EXIT=$LASTEXITCODE"
+    ```
+
+  ★ **命令一律走代码块**，不要写在 JSON 字符串里 —— 命令里几乎一定有引号，
+    塞进 JSON 就得转义，而转义一错**整个工具调用就废了**（实测反复栽在这上面）。
+  （只有路径、文件名这类短参数才照常写在 JSON 里。）
   Windows 路径的反斜杠写两个：D:\\\\创业\\\\file.txt
 
 **情况二：不需要工具，直接回答用户**
@@ -509,9 +525,16 @@ _TOOL_MARKERS = ('{"tool_use"', '{ "tool_use"', '{"tool_calls"', '{ "tool_calls"
 _CODE_BLOCK_RE = re.compile(r'```[a-zA-Z0-9_+\-]*\r?\n(.*)\r?\n?\s*```', re.S)
 
 # 哪个工具缺哪个字段时，用代码块补上
+#
+# ★ 这张表必须**写全**。漏了哪个工具，_attach_code_block 就会掉进下面那个
+#   「填第一个空字段」的兜底分支：兜底按 ('content','command',...) 的顺序填，
+#   于是 PowerShell 的代码块内容会被填进 `content`、而 `command` 空着 ——
+#   发上去 Claude Code 直接拒，比不填还糟。
+#   Windows 上 Claude Code 的命令工具叫 PowerShell（不是 Bash），实测踩过。
 _BLOCK_FIELD = {
     'Write': 'content',
     'Bash': 'command',
+    'PowerShell': 'command',
     'Edit': 'new_string',
     'NotebookEdit': 'new_source',
 }
@@ -742,7 +765,7 @@ def retry_reason(parsed, tools):
     """
     这条回复为什么**不能**就这么交给上游。返回 None = 可以放行。
 
-    两类问题，都得重问一次：
+    两类问题，都得重问（最多 MAX_RETRIES 次）：
       ① 看着像写坏了的工具调用（JSON 转义炸了）—— 见 should_retry()
       ② 解析出了工具调用，但必填的长字段是空的 —— 典型是 Write 没有 content，
          根因通常是回复被网页的输出长度上限截断了
@@ -752,10 +775,12 @@ def retry_reason(parsed, tools):
     """
     if should_retry(parsed, tools):
         return ('你上一条回复不是合法 JSON —— 长文本塞进字符串时转义出错了。'
-                '**改用这个写法**：JSON 里只留路径等短参数，要写的文件内容'
-                '**原样放在 JSON 后面的代码块里**，一个字符都不用转义：\n'
+                '**改用这个写法**：JSON 里只留路径等短参数，要写的文件内容、'
+                '要跑的命令都**原样放在 JSON 后面的代码块里**，一个字符都不用转义：\n'
                 '{"tool_use": {"name": "Write", "input": {"file_path": "..."}}}\n'
-                '```\n（这里原样写内容）\n```')
+                '```\n（这里原样写内容）\n```\n'
+                '★ **命令（PowerShell / Bash）一律这么写** —— 命令里几乎一定有引号，'
+                '塞进 JSON 字符串就得转义，而转义一错**整个工具调用就废了**。')
 
     if not tools or parsed[0] != 'tools':
         return None
@@ -763,6 +788,18 @@ def retry_reason(parsed, tools):
     if not bad:
         return None
     field = _BLOCK_FIELD.get(bad.get('name'))
+
+    # 命令类和文件内容类要给**完全不同的**建议：命令没有「分几段写」这回事，
+    # 照搬下面那套会让模型去分段拼一条命令，越修越乱。
+    if field == 'command':
+        return ('你上一条回复**被长度上限截断了** —— 工具调用只写了一半：'
+                '要调 %s，但 %s 是空的。这种调用发出去必然失败。\n\n'
+                '**把命令原样写在 JSON 后面的代码块里**，一个字符都不用转义：\n'
+                '{"tool_use": {"name": "%s", "input": {"description": "..."}}}\n'
+                '```\n（这里原样写命令，引号照写）\n```\n'
+                '不要为了塞进 JSON 字符串去转义引号 —— 实测转义一错整个调用就废。'
+                % (bad.get('name'), field, bad.get('name')))
+
     return ('你上一条回复**被网页的长度上限截断了** —— 工具调用只写了一半：'
             '要调 %s，但 %s 是空的。这种调用发出去必然失败。\n\n'
             '一次回复最多只能输出约 12000 字符，所以**长文件必须分几段写**：\n'
@@ -1104,16 +1141,37 @@ class Handler(BaseHTTPRequestHandler):
 
         parsed = parse_reply(raw)
 
-        # 这条回复有没有「不能就这么发上去」的毛病 → 有就重问一次。
+        # 这条回复有没有「不能就这么发上去」的毛病 → 有就重问。
         # 两类毛病（JSON 写坏了 / 工具调用缺长字段）见 retry_reason()。
-        reason = retry_reason(parsed, tools)
-        if reason:
+        #
+        # ★ 为什么是**多次**而不是一次：这两类毛病不是偶发，而是模型写命令时
+        #   不转义引号这种系统性习惯 —— 实测同一个错连犯两次。只重试一次的话，
+        #   第二次撞上同一个习惯就认输，把 JSON 原文当回答交给 Claude Code，
+        #   那一轮没有工具可调、会话就停在提示符上等用户手打「继续」。
+        #   有界重试的形状照抄 deepseek_ask.ensure_browser。
+        for attempt in range(1, MAX_RETRIES + 1):
+            reason = retry_reason(parsed, tools)
+            if not reason:
+                break
+
             _bad = incomplete_tool(parsed[1]) if parsed[0] == 'tools' else None
             if _bad:
-                ds.log('[重试] %s 缺 %s（多半是被长度上限截断了），重新问一次'
-                       % (_bad.get('name'), _BLOCK_FIELD.get(_bad.get('name'))))
+                ds.log('[重试] 第 %d/%d 次：%s 缺 %s（多半是被长度上限截断了），'
+                       '重新问一次'
+                       % (attempt, MAX_RETRIES, _bad.get('name'),
+                          _BLOCK_FIELD.get(_bad.get('name'))))
             else:
-                ds.log('[重试] 输出像是坏掉的工具调用，重新问一次')
+                ds.log('[重试] 第 %d/%d 次：输出像是坏掉的工具调用，重新问一次'
+                       % (attempt, MAX_RETRIES))
+
+            # ★ 同一个错犯第二次，说明是系统性习惯，把原话再说一遍没用 ——
+            #   第二遍换一句更狠的：只要一个工具调用、命令放代码块、别的都别写。
+            if attempt > 1:
+                reason += ('\n\n★ 上一次你还是这么写坏的。这次**只输出一个 JSON 对象，'
+                           '后面紧跟一个代码块，不要有任何别的文字**。'
+                           '要跑的命令**原样写在代码块里**，'
+                           'JSON 字符串里**一个引号都不要出现**。')
+
             try:
                 # ★ 只发一句短的追问，不要把整个提示词重发一遍。
                 #   早先是 `prompt + 提醒` 一起发 —— 那等于往同一个对话里
@@ -1147,10 +1205,29 @@ class Handler(BaseHTTPRequestHandler):
                     # ★ web_url 刻意不更新 —— 重试用的是临时对话，
                     #   主对话还是原来那个，下一轮继续在它上面接着聊。
                     ds.log('[重试] 成功（在临时对话里做的，主对话没被污染）')
-                else:
-                    ds.log('[重试] 还是坏的，按普通回答处理')
+                    break
+                ds.log('[重试] 还是坏的，接着重问')
             except Exception as e:
                 ds.log(f'[重试] 失败：{e}')
+                # 重试本身出错（网页超时 / 服务器繁忙）—— 再试多半还是错。
+                # 快速失败，别把上游客户端一起拖超时。
+                break
+
+        # ★ 几次都没修好 —— 这一轮拿不到可用的工具调用。
+        #   **绝不要**把 JSON 原文当「回答」交出去：Claude Code 收到一段没有
+        #   tool_use 的文本，这一轮就直接结束，用户看到一坨 JSON、还得自己手打
+        #   「继续」—— 这正是这个分支以前的老毛病。
+        #   改成报 5xx，让 Claude Code 自己的退避重试接管：它重发同一个请求时，
+        #   decide_prompt 会走「没有新消息 → 重发最后一条」，在**同一个网页对话**
+        #   里重问一次（对话历史不丢），等于自动替用户说了「继续」。
+        if retry_reason(parsed, tools):
+            ds.log('[重试] %d 次都没修好，返回 500 交给上游重试。原始回复：%r'
+                   % (MAX_RETRIES, raw[:400]))
+            self._json(500, {'type': 'error', 'error': {
+                'type': 'api_error',
+                'message': '模型这一轮的工具调用被引号转义弄坏了，重试 %d 次仍没修好。'
+                           '这一轮没有可用的工具调用，请重试。' % MAX_RETRIES}})
+            return
 
         # 过滤掉模型凭空编的工具名（实测见过 noop / no_tool_available）。
         # 直接透给 Claude Code 会变成「未知工具」报错，还不如当普通回答。

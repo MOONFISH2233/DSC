@@ -228,6 +228,42 @@ def test_unit():
           r3[0] == 'tools' and 'python a.py' in (r3[1][0]['input'].get('command') or ''),
           str(r3)[:100])
 
+    # ★ PowerShell 的命令同理 —— 而且这条是**回归用例**。
+    #   Windows 上 Claude Code 的命令工具叫 PowerShell（不是 Bash）。_BLOCK_FIELD
+    #   里漏了它的话，_attach_code_block 会掉进「填第一个空字段」的兜底分支：
+    #   兜底按 ('content','command',...) 的顺序填，于是代码块内容进了 `content`
+    #   而 `command` 空着 —— 发上去 Claude Code 直接拒。实测踩过，别删这条。
+    r6 = cs.parse_reply('{"tool_use": {"name": "PowerShell", "input": {"description": "跑"}}}\n'
+                        '```\npy -3.11 a.py 2>&1; Write-Output "EXIT=$LASTEXITCODE"\n```')
+    check('★ PowerShell 命令也能走代码块，且填对 command 字段',
+          r6[0] == 'tools'
+          and 'Write-Output' in (r6[1][0]['input'].get('command') or '')
+          and not r6[1][0]['input'].get('content'),
+          str(r6)[:140])
+
+    PS = [{'name': 'PowerShell'}]
+    check('★ PowerShell 缺 command 要触发重试',
+          cs.incomplete_tool([{'name': 'PowerShell', 'input': {}}]) is not None)
+    check('★ 缺 command 的重试提示要求把命令放代码块',
+          '代码块' in (cs.retry_reason(
+              ('tools', [{'name': 'PowerShell', 'input': {}}]), PS) or ''))
+
+    # ★ 回归：这是用户终端里**真实出现过**的那一坨 —— 模型把 PowerShell 命令
+    #   塞进 JSON 字符串却没转义引号（命令里几乎一定有引号），JSON 因此报废。
+    #   整条链路是：
+    #     parse_reply 判成「普通回答」→ looks_broken 认出 → 重试
+    #   而重试若也失败，旧代码就把这坨 JSON 原文当回答交给 Claude Code ——
+    #   那一轮没有 tool_use 可调，会话停在提示符上等用户手打「继续」。
+    #   钉住它：这条绝不能被当成正经回答放行。
+    JUNK = (r'''{"tool_use": [{"name": "PowerShell", "input": {"command": "cd 'D:\创业\听刻'; '''
+            r'''py -3.11 -m py_compile x.py 2>&1; Write-Output "EXIT=$LASTEXITCODE"", '''
+            r'''"timeout": 600000}}]}''')
+    pj = cs.parse_reply(JUNK)
+    check('★ 引号没转义的调用被判成「普通回答」（那坨 JSON 就是这么来的）',
+          pj[0] == 'reply', str(pj)[:80])
+    check('★ 它必须被认成坏输出并触发重试（不能当正经回答放行）',
+          cs.looks_broken(JUNK) and cs.should_retry(pj, PS))
+
     # 短内容直接写 JSON 的老写法必须继续有效
     r2 = cs.parse_reply('{"tool_use": {"name": "Write", "input": '
                         '{"file_path": "D:' + B + 'a.py", "content": "print(1)"}}}')
@@ -780,7 +816,13 @@ def test_live():
     # 这几个不是「页面上永远有」的：
     #   answer_body     —— 新对话里还没有任何回答
     #   continue_button —— 只在回答被长度限制截断时才出现
-    fresh_chat_optional = {'answer_body', 'continue_button'}
+    #   server_busy     —— 只在服务端**真的限流**时才出现（选择器是
+    #                      `text:服务器繁忙`，纯文案锚点）。要求它「有命中」
+    #                      等于要求「此刻 DeepSeek 正在繁忙」，所以它总是在
+    #                      不忙的时候红。断言必须区分「选择器坏了」和
+    #                      「选择器现在不该命中」——把后者写进前者的判据里，
+    #                      得到的就是一条时红时绿的自检。
+    fresh_chat_optional = {'answer_body', 'continue_button', 'server_busy'}
     for key, locs in ds.SEL.items():
         n = len(page.eles(locs if isinstance(locs, str) else locs[0], timeout=2))
         if key in fresh_chat_optional:
