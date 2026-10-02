@@ -36,7 +36,8 @@ def check(name, cond, detail=''):
 #     也变成了「内部件」—— 绕过它们自己拼一串，就是同类 bug 的温床。
 # 光拦旧的那两个是不够的：新入口的每一层都得纳入检查，否则「收敛」只防住了上次那种写法。
 FORBIDDEN_IN_SERVERS = ('wait_answer', 'send_question', 'ensure_browser',
-                        'ensure_page', 'set_think', 'ask')
+                        'ensure_page', 'set_think', 'set_search', 'set_toggle',
+                        'ask')
 
 
 def _bypass_calls(path, names=FORBIDDEN_IN_SERVERS):
@@ -286,6 +287,77 @@ def test_unit():
     got5 = r5[1][0]['input'].get('content', '') if r5[0] == 'tools' else ''
     check('★ 内容里带 ``` 时不被静默截断', got5.strip() == md_body,
           f'原始 {len(md_body)} 字，取到 {len(got5)} 字：{got5[:40]!r}')
+
+    section('单元 · 中间文字（叙述）+ 响应混排')
+    # ★ 用户的实际抱怨：「dsc 基本上全是命令，只有最后会输出一段结果文字，
+    #   而直接接 API 的不仅是一堆命令，还能看到每个阶段在干什么」。
+    #   根因是叙述被丢在两处：parse_reply 不返回它、to_anthropic_tools 只造
+    #   tool_use 块。这里把两处都钉住。
+    rp = cs.parse_reply('先看看目录里有什么。\n'
+                        '{"tool_use": {"name": "Read", "input": {"file_path": "D:' + B + 'a.py"}}}')
+    check('★ 夹带的叙述被保留成第三个返回值',
+          rp[0] == 'tools' and '先看看目录' in (rp[2] or ''), repr(rp[2])[:80])
+    check('纯 JSON（没有叙述）时第三个返回值为空',
+          cs.parse_reply('{"tool_use": {"name": "Read", "input": {}}}')[2] == '')
+    check('普通回答时第三个返回值也是空（正文在 [1] 里）',
+          cs.parse_reply('这就是答案。')[0] == 'reply'
+          and cs.parse_reply('这就是答案。')[2] == '')
+
+    # 响应混排：text 块必须在 tool_use 块**前面**，且 stop_reason 仍是 tool_use
+    # （带工具就要让 Claude Code 继续跑，改成 end_turn 这一轮就结束了）
+    m = cs.to_anthropic_tools([{'name': 'Read', 'input': {'file_path': 'a'}}], text='我读一下')
+    check('★ 带叙述时 content = [text, tool_use]',
+          [b['type'] for b in m['content']] == ['text', 'tool_use'],
+          str([b['type'] for b in m['content']]))
+    check('★ 混排时 stop_reason 仍是 tool_use（不能变 end_turn）',
+          m['stop_reason'] == 'tool_use', m['stop_reason'])
+    check('不带叙述时不凭空插 text 块',
+          [b['type'] for b in cs.to_anthropic_tools(
+              [{'name': 'Read', 'input': {}}])['content']] == ['tool_use'])
+
+    # ★ sse_events 原先**零测试覆盖**，而混排是这轮新引入的用法 —— 钉住它。
+    ev = cs.sse_events(m)
+    # 注意数的是 `event: content_block_stop` 而不是 `content_block_stop` ——
+    # 后者在事件名和数据行里各出现一次，会把 2 个块数成 4 个（踩过）。
+    check('★ sse 流里 text 块在前、tool_use 块在后（index 0 / 1）',
+          ev.index('"index": 0') < ev.index('"index": 1')
+          and ev.count('event: content_block_stop') == 2,
+          f'stop 事件 {ev.count("event: content_block_stop")} 个')
+
+    section('单元 · 模型申请开开关（[[SEARCH]] 标记）')
+    # ★ 真实 API 那边模型自己调 WebSearch；这边换成「它写标记、我们替它开」。
+    #   判定必须**严**：只认整条回复就是标记 —— 模型解释这个协议本身时也会
+    #   写出这几个字，误判就会白等 30 秒重搜一轮。
+    check('[[SEARCH]] 被认出',
+          cs.parse_need_marker('[[SEARCH]]') == (True, False))
+    check('[[THINK]] 被认出',
+          cs.parse_need_marker('[[THINK]]') == (False, True))
+    check('[[SEARCH+THINK]] 两个都要',
+          cs.parse_need_marker('[[SEARCH+THINK]]') == (True, True))
+    check('前后有空白 / 换行也认',
+          cs.parse_need_marker('\n  [[search]]  \n') == (True, False))
+    check('第一行是标记、后面还写了别的 —— 也认',
+          cs.parse_need_marker('[[SEARCH]]\n顺便说一句这个功能刚加上。') == (True, False))
+    check('★ 但「标记 + 同一行还有别的字」不算（那是解释协议，不是申请）',
+          cs.parse_need_marker('[[SEARCH]] 这个词的意思是申请联网。') == (False, False))
+    check('★ 正常回答里提到这些字**不能**触发（整条就是标记才算）',
+          cs.parse_need_marker('你可以用 [[SEARCH]] 让我联网搜。') == (False, False))
+    check('★ 带工具调用的回复不能被误判成申请',
+          cs.parse_need_marker('{"tool_use": {"name": "Read", "input": {}}}') == (False, False))
+    check('空回复不误判', cs.parse_need_marker('') == (False, False))
+
+    section('单元 · 工具描述截断（交互类工具不能砍）')
+    # ★ 这几个工具的描述原先一律被截到 400 字，「什么时候该用」那段直接被砍光 ——
+    #   模型压根不知道有这回事，于是 dsc 里从来不弹选择框、不进 plan mode。
+    long_desc = 'X' * 1500
+    rq = cs.render_tools([{'name': 'AskUserQuestion', 'description': long_desc,
+                           'input_schema': {}}])
+    check('★ 交互类工具的描述不被截到 400 字',
+          'X' * 1500 in rq, f'只留了 {len(rq)} 字')
+    rn = cs.render_tools([{'name': 'SomeNormalTool', 'description': long_desc,
+                           'input_schema': {}}])
+    check('★ 普通工具仍然截到 400 字（防止提示词悄悄膨胀）',
+          'X' * 400 in rn and 'X' * 401 not in rn)
 
     section('单元 · Windows 路径转义')
     # ★ 回归：模型写路径时几乎从不转义，而 JSON 里 \b \f \n \r \t \u 都是

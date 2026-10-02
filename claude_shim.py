@@ -52,6 +52,16 @@ MAX_PROMPT_CHARS = 300000
 DEFAULT_THINK = False
 _think_state = {'on': DEFAULT_THINK}
 
+# 智能搜索开关。切法和 think 一样：
+#   ① 模型名带 search：ANTHROPIC_MODEL=deepseek-web-search → /model 中途切
+#   ② HTTP 开关：GET /search?set=on|off  →  终端里 dscsearch on / dscsearch off
+#   ③ 模型自己按需申请：回复里输出 [[SEARCH]] 标记（见 NEED_MARKER_RE）
+#
+# ★ 为什么默认关，且主要靠 ③：开着搜索时每一轮都要先联网搜一轮，
+#   首字 30 秒起步。常开等于把每一轮都拖慢，长任务直接不能用。
+DEFAULT_SEARCH = False
+_search_state = {'on': DEFAULT_SEARCH}
+
 # 全量发送时最多带多少条历史。
 # 为什么要有这个：把一晚上的长对话（实测 631 条消息 = 91 万字）第一次切到
 # shim 时，全量发过去会被截断到 6 万字 —— 输出规则和近半上下文全丢，模型
@@ -137,12 +147,21 @@ OUTPUT_RULES = """
 
 **情况一：需要调用工具**
 
-只输出一个 JSON 对象，前后不要有任何文字、不要 markdown 代码块：
+**先用一句话说明你接下来要干什么**（不超过 100 字，就像跟人说话那样，
+比如「先看看目录里有什么」「这三处我一起改掉」），**然后另起一段**输出 JSON：
 
   一个工具： {"tool_use": {"name": "<工具名>", "input": {<参数>}}}
 
   多个工具： {"tool_use": [{"name": "<名1>", "input": {<参数1>}},
                           {"name": "<名2>", "input": {<参数2>}}]}
+
+★ 那句话是**给用户看的** —— 他在终端上只看得见你调了哪些工具，不说明一句，
+  他完全不知道你在干嘛、要往哪走。**一句话就够**，别写小作文：说多了每轮都变慢。
+
+  ⚠️ **例外**：这一轮要是想申请联网 / 深度思考，**就不要说这句话** ——
+     那是下面「情况三」，整条回复**只写那个方括号标记**。
+     **光用嘴说「我先联网搜一轮」没有任何用**：我们看不见你的想法，
+     那一轮什么都不会发生，用户只会看到一句空话然后卡在那儿。
 
 ★ **几件事互不依赖时，一次全列出来** —— 比如一次读好几个文件、跑几条独立命令。
   不要一个一个来：每多一轮就要多等十几秒，读 20 个文件就是 20 轮。
@@ -185,6 +204,29 @@ OUTPUT_RULES = """
 
 （之所以这样区分：工具调用很短，包成 JSON 稳妥；但最终回答可能几千字，
 塞进 JSON 字符串会因为换行和引号转义而报废 —— 实测翻过车。）
+
+**情况三：这一轮需要联网搜索，或者需要更深的推理**
+
+★ 你要是判断**这件事需要最新信息**（新闻、价格、版本号、今天发生的事、
+  你拿不准的事实），或者**需要慢慢推理才做得对**（复杂算法、架构设计、
+  容易想错的逻辑），**这一轮不要硬答** —— 整条回复**只有那个标记**，
+  一个字都别多写：
+
+    [[SEARCH]]        想先联网搜一轮
+    [[THINK]]         想开深度思考
+    [[SEARCH+THINK]]  两个都要
+
+  我们看到标记会替你打开对应的开关，然后**把这个问题重新发给你一次**。
+  那一轮你就能用上搜索 / 思考了，正常作答即可。
+
+  ⚠️ **不要写成句子**。写成「我先联网搜一轮」这种话我们是**看不见**的 ——
+     只认方括号标记。写成句子，那一轮就白过了，用户只看到一句空话。
+  ⚠️ 这一轮**不要**再按「情况一」先说一句说明 —— 申请开关的时候，
+     整条回复就只是那个标记。
+
+★ **别滥用**：搜索每轮要多等 30 秒以上，深度思考每轮要好几分钟。
+  日常问答、读文件、改代码、跑命令，都不需要。判断不了就别加，
+  硬答一版出来比空等一轮强。
 """
 
 
@@ -204,6 +246,21 @@ OUTPUT_RULES_NO_TOOLS = """
 """
 
 
+# 工具描述的截断长度。名字 + 参数 schema 才是重点，说明留个头就够。
+DESC_LIMIT = 400
+
+# 但这几个是例外 —— 它们是**交互类**工具，「什么时候该用」那段长说明才是关键，
+# 砍到 400 字就等于没教。
+# ★ 实测：这几个的描述原先一律被截到 400 字，模型压根不知道有这回事，
+#   于是 dsc 里从来不弹 AskUserQuestion、从来不进 plan mode、从来不列 todo。
+# ★ 只给这几个放宽，**刻意不全局放宽** —— Claude Code 一次发 100+ 个工具，
+#   全局放宽会让每轮提示词凭空涨几十 K，每轮都变慢（schema 本来就不截断）。
+DETAILED_DESC_TOOLS = {
+    'AskUserQuestion', 'EnterPlanMode', 'ExitPlanMode', 'TodoWrite', 'Task',
+}
+DESC_LIMIT_DETAILED = 2000
+
+
 def render_tools(tools):
     if not tools:
         # 必须说得够狠 —— 实测只写「没有可用的工具」，模型会凭空编一个
@@ -213,13 +270,42 @@ def render_tools(tools):
         return '（本次没有配置任何工具。你只能直接用文字回答，不要尝试调用工具。）'
     out = []
     for t in tools:
+        name = t.get('name')
+        limit = DESC_LIMIT_DETAILED if name in DETAILED_DESC_TOOLS else DESC_LIMIT
         schema = t.get('input_schema') or t.get('parameters') or {}
         out.append(json.dumps({
-            'name': t.get('name'),
-            'description': (t.get('description') or '')[:400],
+            'name': name,
+            'description': (t.get('description') or '')[:limit],
             'input_schema': schema,
         }, ensure_ascii=False))
     return '\n'.join(out)
+
+
+# 教模型用「交互类工具」。
+#
+# ★ 为什么必须有这一段：这些工具**确实在** Claude Code 发来的工具清单里，但我们
+#   从不告诉模型「什么时候该用」。而 DeepSeek 网页版不是 Claude —— 没人专门训练
+#   它去用这些 agentic 工具。**你不教，它就不会用**，只会闷头调 Read/Write/Bash。
+#   实测症状：dsc 里从来不弹选择框、从来不进 plan mode、从来不列任务清单 ——
+#   而真实 API 直连时这些都会自然发生。
+#
+# ★ 这段必须【每一轮】都出现（见 build_prompt 和 build_delta_prompt）。
+#   delta 路径原先不带任何规则，只写进新会话提示词的话，模型只有第一轮看得见。
+TOOL_GUIDANCE = """
+═══ 什么时候该用这几个工具 ═══
+
+★ **有岔路口、要人拍板时，用 `AskUserQuestion` 问，不要自己猜。**
+  典型场景：两种做法都说得通、要选技术方案、要确认删掉/覆盖某个文件、
+  需求含糊到会明显影响结果。**猜错方向的代价远大于多问一句。**
+  但也别滥用：能自己查清楚的（读文件、搜代码、跑命令）就先自己查。
+
+★ **任务复杂时，先 `EnterPlanMode` 拿个方案再动手。**
+  什么算复杂：要改三个以上文件、要动架构、要做技术选型、你心里没底。
+  简单任务（改个错字、跑条命令、读个文件）直接做，别为了走流程而走流程。
+
+★ **三步以上的活，先 `TodoWrite` 列个清单，之后每完成一步更新一次。**
+  这既是给用户看的进度，也是给你自己记的账 —— 长任务里你很容易忘了还剩哪几件。
+"""
 
 
 ATTACH_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), '_attachments')
@@ -354,6 +440,13 @@ def build_prompt(system, messages, tools):
 
     parts.append(f'═══ 可用工具 ═══\n{render_tools(tools)}')
     parts.append(OUTPUT_RULES if tools else OUTPUT_RULES_NO_TOOLS)
+    if tools:
+        # 交互类工具的用法。必须每轮都在 —— 见 TOOL_GUIDANCE 上面的说明。
+        parts.append(TOOL_GUIDANCE)
+
+    # ★ 到这儿为止都是「头」，截断时原样保住。用 len() 记下来，**不要写死
+    #   parts[:3]** —— 早先就是写死的，加一段就正好被切掉，而且不报错、日志干净。
+    head_n = len(parts)
 
     # 历史太长只取最近的 —— 见 MAX_HISTORY_MSGS 的说明
     total = len(messages)
@@ -378,15 +471,15 @@ def build_prompt(system, messages, tools):
         head = f'（前 {total - MAX_HISTORY_MSGS} 条较早的对话已省略）\n\n' if trimmed else ''
         parts.append('═══ 对话历史 ═══\n' + head + '\n\n'.join(convo))
 
-    parts.append('现在轮到你（助手）回复。记住：只输出一个 JSON 对象。')
+    parts.append('现在轮到你（助手）回复。记住：先一句话说明你要做什么，然后输出 JSON。')
 
     text = '\n\n'.join(parts)
     if len(text) > MAX_PROMPT_CHARS:
-        # 保头（系统提示 + 工具定义 + 输出规则）保尾（最近的对话）
-        head_len = len('\n\n'.join(parts[:3]))
-        keep_tail = MAX_PROMPT_CHARS - head_len - 200
+        # 保头（系统提示 + 工具定义 + 输出规则 + 工具引导）保尾（最近的对话）
+        head = '\n\n'.join(parts[:head_n])
+        keep_tail = MAX_PROMPT_CHARS - len(head) - 200
         ds.log(f'[警告] 提示词 {len(text)} 字，超限，截断到 {MAX_PROMPT_CHARS}')
-        text = '\n\n'.join(parts[:3]) + '\n\n（中间历史已省略）\n\n' + text[-keep_tail:]
+        text = head + '\n\n（中间历史已省略）\n\n' + text[-keep_tail:]
     return text
 
 
@@ -611,6 +704,10 @@ def _extract_embedded_tools(text):
       JSON 时，工具调用本身就能超过 20000 字**（写 figs.py 这种画图脚本就是），
       于是配对永远到不了 depth 0 → 抠不出来 → 整坨 JSON 泄漏成「回答」，
       用户看到一屏 JSON，任务断掉。踩过。
+
+    返回 `(tools, idx)` —— `idx` 是**成功解析出来的**那段 JSON 的起点，
+    调用方靠它切出前面的说明文字（见 parse_reply 的第三个返回值）。
+    没抠出来就是 `([], -1)`。
     """
     limit = len(text)
     for marker in _TOOL_MARKERS:
@@ -629,14 +726,31 @@ def _extract_embedded_tools(text):
                     if _looks_like_call(obj):
                         tools = _tools_from(obj)
                         if tools:
-                            return tools
+                            return tools, idx
                     break
-    return []
+    return [], -1
+
+
+# 夹带叙述的长度上限。提示词里跟模型说的是「不超过 100 字」，但它会飘 ——
+# 这里兜一道，免得它写一屏（每多一个字，用户就多等一点）。
+MAX_PROSE_CHARS = 400
 
 
 def parse_reply(raw):
     """
-    返回 ('tools', [{'name':..., 'input':{...}}, ...]) 或 ('reply', text)。
+    返回三元组 `(kind, payload, prose)`：
+
+      ('tools', [{'name':..., 'input':{...}}, ...], '一句叙述')  ← 要调工具，可能带说明
+      ('reply', '正文', '')                                      ← 直接回答
+
+    ★ 为什么多返回一个 prose：真实 API 那边，模型是「先说一句我在干嘛、再调工具」，
+      用户在界面上看得见它在往哪走。我们早先把这段说明**扔了** —— 用户在 dsc 里
+      只看到一排光秃秃的工具调用，完全不知道模型在想什么（实测反馈：
+      「dsc 基本上全是命令，只有最后会输出一段结果文字」）。
+      叙述现在会作为 text 块，放在 tool_use 块**前面**（见 to_anthropic_tools）。
+
+    ★ 三元组是**索引兼容**的：全仓调用方都只用 `r[0]`/`r[1]`，多一个元素不破坏
+      任何现有代码（handler 两处 + selftest 约 30 处，逐个确认过）。
 
     设计要点：
       · **只有工具调用需要是 JSON，最终回答就是普通 Markdown。**
@@ -650,12 +764,13 @@ def parse_reply(raw):
       · **支持一次多个** —— 读 21 个文件时一次要 21 个 Read，不然就是 21 轮。
     """
     if not raw:
-        return ('reply', '')
+        return ('reply', '', '')
 
     t = raw.strip()
 
     # 只有「整个回答就是一个 JSON 对象」时才尝试解析（首字符 { 末字符 }）——
     # 这样既认得出工具调用，又不会把中间带代码块的 Markdown 回答误判成 JSON。
+    # 反过来说：能进这个分支，就说明前面**没有**说明文字，prose 恒为空。
     stripped = re.sub(r'```(?:json)?\s*|\s*```', '', t).strip()
     if stripped.startswith('{') and stripped.endswith('}'):
         i, j = stripped.find('{'), stripped.rfind('}')
@@ -666,25 +781,62 @@ def parse_reply(raw):
                 if tools:
                     # 长内容可能放在 JSON 后面的代码块里（不用转义）——
                     # 短内容直接写在 JSON 里也认
-                    return ('tools', _attach_code_block(t, tools))
+                    return ('tools', _attach_code_block(t, tools), '')
                 # 兼容各种「回答」的包法。实测见过 reply / answer —— 模型
                 # 对格式的想象力比我们以为的丰富，多认几种不会错。
                 for k in ('reply', 'answer', 'response', 'text', 'content'):
                     v = obj.get(k)
                     if isinstance(v, str) and v.strip():
-                        return ('reply', v)
+                        return ('reply', v, '')
 
     # 整段不是 JSON —— 但可能是「先解释一段、再给工具调用」的混合输出。
     # 模型在上一步失败之后特别爱这么写。整段当回答返回的话，
     # 用户看到的就是一坨 JSON 文本、任务直接断掉。
-    embedded = _extract_embedded_tools(t)
+    embedded, idx = _extract_embedded_tools(t)
     if embedded:
         ds.log(f'[提示] 模型在 {len(t)} 字的说明里夹带了 {len(embedded)} 个工具调用，已抠出来')
+        # idx 之前那段就是叙述 —— 这就是用户要看的「中间文字」
+        prose = t[:idx].strip()[:MAX_PROSE_CHARS]
         # ★ 这里也要补代码块 —— 「JSON + 后面跟代码块」走的正是这条路
         #   （整段不以 } 结尾，所以进不了上面那个分支）。漏了的话长内容就丢了。
-        return ('tools', _attach_code_block(t, embedded))
+        return ('tools', _attach_code_block(t, embedded), prose)
 
-    return ('reply', t)
+    return ('reply', t, '')
+
+
+# 模型「申请开开关」的标记。整条回复就是它，别的什么都不写。
+#
+# ★ 为什么要有这个协议：真实 API 那边，模型想联网就直接调 WebSearch 工具 ——
+#   「该不该搜」由它自己判断。网页版这边搜索是个手动开关，我们没法让模型去点，
+#   于是约定：**它写标记，我们替它开好、再把问题重发一次**。
+#   把判断权交给模型，比在 shim 里堆「最新/新闻/今天」这类关键词靠谱得多
+#   （关键词法会误判：该搜的没搜、不该搜的乱搜还白等 30 秒）。
+#
+# ★ 必须匹配**整条回复**，不能只是「包含」：模型在回答里解释这个协议本身
+#   （比如被问到「你怎么联网的」）时也会写出这几个字，那绝不能触发重搜。
+NEED_MARKER_RE = re.compile(r'^\s*\[\[\s*([A-Za-z+\s]+?)\s*\]\]\s*$')
+
+
+def parse_need_marker(raw):
+    """
+    模型是不是在申请开开关。返回 (want_search, want_think)。
+
+    认两种写法：
+      · 整条回复就是那个标记
+      · **第一行**就是那个标记（模型有时会忍不住在后面再补一句 ——
+        实测它甚至会只写「我先联网搜一轮」这种人话，那种认不出来，
+        所以提示词里专门加了「不要写成句子」的警告）
+
+    ★ 两种都要求那一行**只有**标记本身。`[[SEARCH]] 这个词的意思是……` 不算 ——
+      模型解释这个协议本身时就是这种句子，误判的代价是白等 30 秒重搜一轮。
+    """
+    m = NEED_MARKER_RE.match(raw or '')
+    if not m:
+        m = NEED_MARKER_RE.match((raw or '').strip().split('\n', 1)[0])
+    if not m:
+        return False, False
+    which = re.sub(r'\s+', '', m.group(1)).upper()
+    return 'SEARCH' in which, 'THINK' in which
 
 
 def looks_broken(raw):
@@ -866,18 +1018,30 @@ def build_delta_prompt(new_msgs):
     if not parts:
         return '继续。'
     return ('═══ 继续 ═══\n\n' + '\n\n'.join(parts) +
-            '\n\n继续。记住：只输出一个 JSON 对象（工具调用或最终回答）。')
+            '\n\n继续。记住：先一句话说明你要做什么，然后输出 JSON（工具调用或最终回答）。\n'
+            # ★ 工具引导在这儿只留压缩版：delta 是**每轮**都走的路径，而完整版
+            #   （TOOL_GUIDANCE）只在会话第一轮出现。这里不重复一句的话，
+            #   模型从第二轮起就把这些工具忘光了。
+            '（有岔路口要人拍板 → 用 AskUserQuestion 问，别自己猜；'
+            '复杂的活 → 先 EnterPlanMode 拿方案；三步以上 → 先 TodoWrite 列清单。）')
 
 
 def ask_web(prompt, goto_url=None, think=None, attachments=None,
-            start_limit=None, total_limit=None, key=None):
+            start_limit=None, total_limit=None, key=None, search=None):
     """
     goto_url=None → 开新对话；否则跳回指定的网页对话。
-    think=None → 用当前全局开关；True/False → 本次强制。
+    think/search=None → 用当前全局开关；True/False → 本次强制。
     返回 (回答原文, 当前对话的 URL)
+
+    ★ `search` 必须留在**参数表末尾**。底下那个重试调用点是**位置传参**
+      （`(prompt + reason, None, think, attach, ...)`），往中间插一个参数会让
+      attachments 静默错位；而且 selftest 用 AST 检查「第 4 个位置参数是
+      attachments」来防止重试路径漏传附件 —— 错位会让那层保护**静默失效**。
     """
     if think is None:
         think = _think_state['on']
+    if search is None:
+        search = _search_state['on']
     # ★ 这里**刻意不设进程内全局锁**。
     #   串行化现在由 ds.ask_in_session → browser_lock(key) 负责，而且是**按会话分锁**：
     #   不同会话各用各的标签页，可以真并行。
@@ -887,7 +1051,7 @@ def ask_web(prompt, goto_url=None, think=None, attachments=None,
         prompt, think, new_chat=True, attachments=attachments,
         navigate_to=goto_url, start_limit=start_limit, total_limit=total_limit,
         # key = 会话 id → 每个 dsc 会话用自己的标签页
-        key=key)
+        key=key, search=search)
     if err:
         raise RuntimeError(err)
     # ★ URL 必须在【发出消息之后】取 —— 发之前页面还是 chat.deepseek.com/ 根地址，
@@ -899,20 +1063,32 @@ def ask_web(prompt, goto_url=None, think=None, attachments=None,
 # Anthropic 响应格式
 # ============================================================
 
-def to_anthropic_tools(tools, model='deepseek-web'):
+def to_anthropic_tools(tools, model='deepseek-web', text=None):
     """
     一个或多个工具调用 → 一条 Anthropic 消息。
 
     多个就是 content 里放多个 tool_use 块 —— Claude Code 会**并行**执行它们。
     读 21 个文件时这一条就是 1 轮 vs 21 轮的区别。
+
+    `text` 非空时，会在所有 tool_use 块**前面**插一个 text 块 —— 这就是模型的
+    「中间文字」（「先看看目录里有什么」）。真实 API 的模型一直这么干，用户在界面上
+    看得见它在往哪走；我们早先把这段扔了，dsc 里就只剩光秃秃的工具调用。
+
+    ★ 顺序必须是 text 在前、tool_use 在后 —— 用户先看见说明，再看见工具。
+    ★ `stop_reason` 必须仍是 `'tool_use'`：带工具就要让 Claude Code 继续跑，
+      不能改成 end_turn，否则这一轮直接结束。
     """
+    content = []
+    if text:
+        content.append({'type': 'text', 'text': text})
+    content.extend({'type': 'tool_use',
+                    'id': 'toolu_' + uuid.uuid4().hex[:20],
+                    'name': t['name'], 'input': t['input']}
+                   for t in tools)
     return {
         'id': 'msg_' + uuid.uuid4().hex[:20],
         'type': 'message', 'role': 'assistant', 'model': model,
-        'content': [{'type': 'tool_use',
-                     'id': 'toolu_' + uuid.uuid4().hex[:20],
-                     'name': t['name'], 'input': t['input']}
-                    for t in tools],
+        'content': content,
         'stop_reason': 'tool_use', 'stop_sequence': None,
         'usage': {'input_tokens': 0, 'output_tokens': 0},
     }
@@ -1001,24 +1177,31 @@ class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         p = self._path()
 
-        # /think?set=on|off  —— 中途切深度思考，不用重启
-        if p == '/think':
+        # /think?set=on|off   —— 中途切深度思考，不用重启
+        # /search?set=on|off  —— 同上，切智能搜索
+        # 两个开关除了状态字典和名字以外完全一样，所以合成一个分支 ——
+        # 抄两份的话，下次再加开关又要抄第三份（这个项目栽过「抄三份改两份」的跟头）。
+        if p in ('/think', '/search'):
             from urllib.parse import urlparse, parse_qs
             q = parse_qs(urlparse(self.path).query)
             want = (q.get('set') or [''])[0].lower()
+            state = _think_state if p == '/think' else _search_state
+            name = '深度思考' if p == '/think' else '智能搜索'
+            out_key = 'thinking' if p == '/think' else 'search'
             if want in ('on', '1', 'true', 'yes'):
-                _think_state['on'] = True
+                state['on'] = True
             elif want in ('off', '0', 'false', 'no'):
-                _think_state['on'] = False
+                state['on'] = False
             elif want == 'toggle':
-                _think_state['on'] = not _think_state['on']
-            ds.log(f'[深度思考] {"开" if _think_state["on"] else "关"}')
-            self._json(200, {'thinking': _think_state['on']})
+                state['on'] = not state['on']
+            ds.log(f'[{name}] {"开" if state["on"] else "关"}')
+            self._json(200, {out_key: state['on']})
             return
 
         if p in ('', '/health', '/api/hello'):
             self._json(200, {'ok': True, 'service': 'deepseek-web → anthropic shim',
-                             'thinking': _think_state['on']})
+                             'thinking': _think_state['on'],
+                             'search': _search_state['on']})
         else:
             self._json(404, {'type': 'error', 'error': {'type': 'not_found',
                                                         'message': self.path}})
@@ -1119,13 +1302,55 @@ class Handler(BaseHTTPRequestHandler):
         if think:
             ds.log('[深度思考] 本轮开启，会慢很多')
 
+        # 智能搜索：同理（模型名带 search 就能在 Claude Code 里 /model 中途切）。
+        # ★ 默认关，而且**刻意不做关键词判定** —— 什么时候该联网交给模型自己判断
+        #   （它会在回复里写 [[SEARCH]] 标记，见下面的「模型申请开开关」）。
+        #   关键词法会误判：该搜的没搜、不该搜的乱搜还白等 30 秒。
+        search = _search_state['on'] or ('search' in str(req.get('model') or '').lower())
+
         try:
-            raw, web_url = ask_web(prompt, goto, think, attach, key=sid)
+            raw, web_url = ask_web(prompt, goto, think, attach, key=sid, search=search)
         except Exception as e:
             ds.log(f'[失败] {e}')
             self._json(500, {'type': 'error', 'error': {'type': 'api_error',
                                                         'message': str(e)}})
             return
+
+        # ★ 模型申请开开关（[[SEARCH]] / [[THINK]]）—— 真实 API 那边是模型自己
+        #   调 WebSearch，这边换成「它写个标记、我们替它开、再把问题重发一次」。
+        #
+        #   为什么在**同一个网页对话**里重发，而不是像重试那样开新对话：
+        #   重试是「纠正错误」，开新对话是为了不把错误留在历史里；而这里模型只是
+        #   说了句「我需要联网」，是**正当的对话内容**，不是错误。同对话还能保住
+        #   上下文 —— 不然得把几万字的提示词整个重发一遍。
+        #
+        #   ★ 每条请求**最多认一次**（下面那个二次检查就是防循环的闸），
+        #     否则模型犯起轴来会来回死循环。
+        want_search, want_think = parse_need_marker(raw)
+        if want_search or want_think:
+            opened = [n for n, w in (('联网搜索', want_search),
+                                     ('深度思考', want_think)) if w]
+            ds.log(f'[申请] 模型要求打开「{"、".join(opened)}」—— 开好后重发同一问题')
+            try:
+                raw, web_url = ask_web(
+                    '（已为你打开%s。请重新回答上面那个问题。）' % '、'.join(opened),
+                    web_url,                      # ← 同一个网页对话，不新开
+                    think or want_think,
+                    # 附件原样带上。对话里其实已经有了，重发一遍是冗余的 ——
+                    # 但宁可冗余也别漏：漏附件会让模型看不见图，然后反复调 Read，
+                    # 陷入死循环（这个项目栽过）。冗余的代价只是多传一次。
+                    attach,
+                    key=sid, search=search or want_search)
+            except Exception as e:
+                ds.log(f'[申请] 重发失败：{e}（按原来那条回复继续）')
+            again_s, again_t = parse_need_marker(raw)
+            if again_s or again_t:
+                # 开好了还申请 —— 不再循环，给一句人话收场。
+                # （这比把标记原样交给 Claude Code 强：那样这一轮会以一句
+                #   `[[SEARCH]]` 结束，用户完全看不懂发生了什么。）
+                ds.log('[申请] 开关已经开了还要标记 —— 不再重发，就此打住')
+                raw = ('（联网搜索 / 深度思考已经打开了，但这一轮没能生成出有效内容。'
+                       '请再说一次，或换个问法。）')
 
         if sid:
             with _sessions_lock:
@@ -1198,7 +1423,12 @@ class Handler(BaseHTTPRequestHandler):
                     attach,
                     # 重试给独立的短超时 —— 用默认那套（90 秒起步）会把
                     # 上游客户端一起拖超时，用户看到的就是「API Error」。
-                    start_limit=25.0, total_limit=60.0, key=sid)
+                    #
+                    # ★ 这里**必须显式关掉 search**：上面那个 25 秒的首字上限
+                    #   比搜索所需的时间（30 秒起步）还短，透传进去必然报
+                    #   「回答没有开始」，然后白白浪费一次重试。重试是修格式，
+                    #   跟联不联网没关系。
+                    start_limit=25.0, total_limit=60.0, key=sid, search=False)
                 p2 = parse_reply(raw2)
                 if not retry_reason(p2, tools):
                     parsed, raw = p2, raw2
@@ -1240,15 +1470,21 @@ class Handler(BaseHTTPRequestHandler):
             if bad:
                 ds.log(f'[警告] 模型编造了工具 {bad}，可用的有 {sorted(valid)[:8]}… 丢弃')
             if good:
-                parsed = ('tools', good)
+                # ★ 别把第三个元素（叙述）丢了 —— 重建元组时漏掉它，
+                #   中间文字就没了，用户又只看到一排工具调用。
+                parsed = ('tools', good, parsed[2])
             else:
                 parsed = ('reply', f'（我试图调用不存在的工具 {bad}，'
-                                   f'但它们不在可用列表里。请换个方式提问。）')
+                                   f'但它们不在可用列表里。请换个方式提问。）', '')
 
         if parsed[0] == 'tools':
             names = [t['name'] for t in parsed[1]]
             ds.log(f'[工具] {len(names)} 个: {names[:6]}{"…" if len(names) > 6 else ""}')
-            msg = to_anthropic_tools(parsed[1], model=req.get('model', 'deepseek-web'))
+            if parsed[2]:
+                # 记一句 —— 出问题时能看出模型当时以为自己要干嘛
+                ds.log(f'[叙述] {parsed[2]!r}')
+            msg = to_anthropic_tools(parsed[1], model=req.get('model', 'deepseek-web'),
+                                     text=parsed[2])
         else:
             # ★ 短回答要连**内容**一起记。只记长度的话出了问题只能靠猜 ——
             #   实测 `[回答] 2 字` 今天出现了 4 次，谁都说不清那 2 个字是什么，

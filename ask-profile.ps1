@@ -138,6 +138,27 @@ function dssessions {
 }
 
 
+function _dstoggle {
+    # dscthink / dscsearch 共用的实体。
+    # 两个开关除了端点、返回字段名、文案以外一模一样 —— 抄两份的话，
+    # 下次再加开关又要抄第三份（这个项目在别处栽过「抄三份改两份」的跟头）。
+    param([string]$Path, [string]$Field, [string]$Name,
+          [string]$Mode, [string]$Hint)
+
+    $q = if ($Mode) { "?set=$Mode" } else { "" }
+    try {
+        $r = Invoke-RestMethod "http://127.0.0.1:8799/$Path$q" -TimeoutSec 5
+        $on = [bool]$r.$Field
+        $verb = if ($Mode) { '已切到' } else { '当前' }
+        Write-Host "[$Name] $verb ：$(if ($on) { '开' } else { '关' })" -ForegroundColor Cyan
+        if ($on -and $Hint) {
+            Write-Host "           $Hint" -ForegroundColor DarkGray
+        }
+    } catch {
+        Write-Host "[$Name] shim 没在跑 —— 先开一个 dsc。" -ForegroundColor Yellow
+    }
+}
+
 function dscthink {
     <#
     .SYNOPSIS
@@ -154,17 +175,29 @@ function dscthink {
         dscthink toggle    # 翻转
     #>
     param([string]$Mode = "")
+    _dstoggle -Path 'think' -Field 'thinking' -Name 'dscthink' `
+              -Mode $Mode -Hint '注意：每轮要等几分钟'
+}
 
-    $q = if ($Mode) { "?set=$Mode" } else { "" }
-    try {
-        $r = Invoke-RestMethod "http://127.0.0.1:8799/think$q" -TimeoutSec 5
-        $state = if ($r.thinking) { '开' } else { '关' }
-        $verb  = if ($Mode) { '已切到' } else { '当前' }
-        Write-Host "[dscthink] $verb ：$state" -ForegroundColor Cyan
-        if ($r.thinking) {
-            Write-Host '           注意：每轮要等几分钟' -ForegroundColor DarkGray
-        }
-    } catch {
-        Write-Host '[dscthink] shim 没在跑 —— 先开一个 dsc。' -ForegroundColor Yellow
-    }
+function dscsearch {
+    <#
+    .SYNOPSIS
+        中途切 DeepSeek 网页版的「智能搜索」（联网），不用重启 dsc。
+
+    .DESCRIPTION
+        开启后网页版会先联网搜一轮再回答，能拿到最新信息。
+        但**每轮首字要等 30 秒以上**，长任务会明显变慢。
+
+        平时不用管它 —— 模型自己判断需要联网时，会在回复里写 [[SEARCH]]，
+        shim 看到就自动打开并重发一次。这个命令是给你手动兜底 / 强制用的。
+
+    .EXAMPLE
+        dscsearch           # 看当前状态
+        dscsearch on        # 强制一直开着
+        dscsearch off       # 关（默认）
+        dscsearch toggle    # 翻转
+    #>
+    param([string]$Mode = "")
+    _dstoggle -Path 'search' -Field 'search' -Name 'dscsearch' `
+              -Mode $Mode -Hint '注意：每轮首字要等 30 秒以上'
 }

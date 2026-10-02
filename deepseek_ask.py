@@ -107,20 +107,21 @@ def join_prompt(parts, head_parts=3, mark='（中间内容已省略）'):
 # 每次问答追加到 history/YYYY-MM-DD.md，一天一个文件
 HISTORY_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'history')
 
-# 完成判定的时间参数，普通模式 / 深度思考模式
+# 完成判定的时间参数：普通档 / 「慢档」
+#
+# ★ 「慢档」＝ 深度思考 **或** 智能搜索，两个走同一套预算。理由：开着智能搜索时
+#   DeepSeek 要**先联网搜一轮**，首字动辄 30 秒以上、整轮也明显更长 —— 给它普通档
+#   的预算就是间歇性误报「回答没有开始」，而且那种失败很安静，看起来像发不出去，
+#   实际只是等得不够久（实测踩过：START 设 20 秒时，长对话里间歇性报错）。
 STABLE_NORMAL, STABLE_THINK = 2.5, 6.0      # 文本连续多久不变算「生成完了」
 TOTAL_NORMAL, TOTAL_THINK = 300.0, 1200.0   # 整体硬超时
 
 # 等「回答开始」的上限。这是**最长**等待，不是固定等待 —— 一旦检测到文本变化
 # 就立刻往下走，所以调大它平时不花任何代价。
-#
-# 必须给足：「智能搜索」开着时，DeepSeek 要先联网搜一轮，首字可能要 30 秒以上。
-# 之前设 20 秒，导致长对话里间歇性误报「回答没有开始」—— 而且那种失败很安静，
-# 看起来像发不出去，实际只是等得不够久。
 START_NORMAL, START_THINK = 90.0, 180.0
 
-if TOTAL_NORMAL >= TOTAL_THINK:
-    raise AssertionError('深度思考的超时必须比普通模式宽松')
+if not (START_NORMAL < START_THINK and TOTAL_NORMAL < TOTAL_THINK):
+    raise AssertionError('「慢档」（深度思考 / 智能搜索）的超时必须比普通档宽松')
 
 
 # ============================================================
@@ -128,6 +129,7 @@ if TOTAL_NORMAL >= TOTAL_THINK:
 # ============================================================
 
 THINK_LABEL = '深度思考'    # 用来在多个 ds-toggle-button 里认出「深度思考」那个
+SEARCH_LABEL = '智能搜索'   # 同上。页面上就这两个开关，共用 toggle_button 选择器
 
 SEL = {
     'chat_input': [
@@ -996,7 +998,8 @@ def send_question(page, text, baseline='', attachments=None):
     raise RuntimeError('三种发送方式都没能把消息发出去 —— 跑 ask --probe 看看选择器')
 
 
-def wait_answer(page, baseline, think, start_limit=None, total_limit=None):
+def wait_answer(page, baseline, think, start_limit=None, total_limit=None,
+                search=False):
     """
     等回答生成完。两道判据：
 
@@ -1012,11 +1015,14 @@ def wait_answer(page, baseline, think, start_limit=None, total_limit=None):
     DOM）和渲染时序影响，在长对话里会间歇性失灵，而且失灵得很安静：
     不报错，只是干等到超时。
     """
-    stable_need = STABLE_THINK if think else STABLE_NORMAL
+    # 深度思考和智能搜索走同一套「慢档」预算 —— 搜索要先联网搜一轮，
+    # 首字动辄 30 秒以上，用普通档会间歇性误报「回答没有开始」。
+    slow = bool(think or search)
+    stable_need = STABLE_THINK if slow else STABLE_NORMAL
     if start_limit is None:
-        start_limit = START_THINK if think else START_NORMAL
+        start_limit = START_THINK if slow else START_NORMAL
     if total_limit is None:
-        total_limit = TOTAL_THINK if think else TOTAL_NORMAL
+        total_limit = TOTAL_THINK if slow else TOTAL_NORMAL
 
     # --- 阶段 1：等回答开始。避免刚发出去就判空。 ---
     deadline = time.time() + start_limit
@@ -1129,23 +1135,40 @@ def find_toggle(page, label, timeout=5):
     return None
 
 
-def set_think(page, on):
-    """幂等：读当前状态，只在需要时点一下。DeepSeek 会记住上次的开关状态。"""
-    btn = find_toggle(page, THINK_LABEL)
+def set_toggle(page, label, on, name):
+    """
+    幂等：读当前状态，只在需要时点一下。DeepSeek 会记住上次的开关状态。
+
+    ★ 为什么必须**每轮都调**，而不是只在「想开」时调：正因为网页会记住状态，
+      用户手动开着的搜索会一直是开的。我们要是以为它是关的，就会在「没料到会联网」
+      的情况下按普通档等超时 —— 那种失败很隐蔽。所以每轮都要**双向**对齐。
+    ★ 不对称语义（沿用早先 set_think 的）：**强开却找不到开关 → 抛错**（整轮 500，
+      让上游重试）；**强关找不到 → 记一行日志放过**。想开没开等于答非所问；
+      想关没关最多是慢一点，不值得把整轮搞失败。
+    """
+    btn = find_toggle(page, label)
     if not btn:
         if on:
-            raise RuntimeError('找不到「深度思考」开关')
-        log('[提示] 页面上没找到「深度思考」开关，按默认（关）继续')
+            raise RuntimeError(f'找不到「{name}」开关')
+        log(f'[提示] 页面上没找到「{name}」开关，按默认（关）继续')
         return
 
     if toggle_state(btn) != on:
         btn.click()
         time.sleep(0.6)
-        btn2 = find_toggle(page, THINK_LABEL)
+        btn2 = find_toggle(page, label)
         if btn2 and toggle_state(btn2) != on:
-            raise RuntimeError('「深度思考」开关切换失败')
+            raise RuntimeError(f'「{name}」开关切换失败')
         # 只在真的切换了才打印 —— 否则交互模式下每轮都刷一行没意义的
-        log(f'[模式] 深度思考已切到：{"开" if on else "关"}')
+        log(f'[模式] {name}已切到：{"开" if on else "关"}')
+
+
+def set_think(page, on):
+    set_toggle(page, THINK_LABEL, on, '深度思考')
+
+
+def set_search(page, on):
+    set_toggle(page, SEARCH_LABEL, on, '智能搜索')
 
 
 def toggle_state(ele):
@@ -1268,7 +1291,7 @@ def do_open(page, n):
 
 
 def ask(page, question, think=False, attachments=None,
-        start_limit=None, total_limit=None):
+        start_limit=None, total_limit=None, search=False):
     """
     **发一个问题并等答案。所有上层都必须走这里。**
 
@@ -1284,13 +1307,14 @@ def ask(page, question, think=False, attachments=None,
     baseline = last_answer_text(page)
     send_question(page, question, baseline, attachments)
     text, err = wait_answer(page, baseline, think,
-                            start_limit=start_limit, total_limit=total_limit)
+                            start_limit=start_limit, total_limit=total_limit,
+                            search=search)
     return (clean(text) if text else text), err
 
 
 def ask_in_session(question, think=False, new_chat=True, attachments=None,
                    page=None, navigate_to=None,
-                   start_limit=None, total_limit=None, key=None):
+                   start_limit=None, total_limit=None, key=None, search=False):
     """
     **一轮完整的问答：拿连接 → 确保页面 → 设开关 → 发问 → 等答案。**
 
@@ -1312,11 +1336,12 @@ def ask_in_session(question, think=False, new_chat=True, attachments=None,
     with browser_lock(key):
         return _ask_in_session_locked(
             question, think, new_chat, attachments, page, navigate_to,
-            start_limit, total_limit, key)
+            start_limit, total_limit, key, search)
 
 
 def _ask_in_session_locked(question, think, new_chat, attachments, page,
-                           navigate_to, start_limit, total_limit, key=None):
+                           navigate_to, start_limit, total_limit, key=None,
+                           search=False):
     """ask_in_session 的实体，调用方必须已经持有 browser_lock。"""
     # 有 key 就用它的专属标签页；开不出来（或没给 key）就用主页面。
     tab = tab_for(key)
@@ -1335,9 +1360,12 @@ def _ask_in_session_locked(question, think, new_chat, attachments, page,
         if not ensure_page(page, new_chat=new_chat):
             return page, None, diagnose_missing_input(page)
 
+    # ★ 两个开关都**每轮双向对齐**，不是「想开才调」—— 网页会记住上次状态，
+    #   用户手动开着的搜索会一直是开的，我们以为它是关的就会算错超时档。
     set_think(page, think)
+    set_search(page, search)
     text, err = ask(page, question, think, attachments,
-                    start_limit=start_limit, total_limit=total_limit)
+                    start_limit=start_limit, total_limit=total_limit, search=search)
     return page, text, err
 
 
