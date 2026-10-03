@@ -302,14 +302,22 @@ TOOL_GUIDANCE = """
 ★ **有岔路口、要人拍板时，用 `AskUserQuestion` 问，不要自己猜。**
   典型场景：两种做法都说得通、要选技术方案、要确认删掉/覆盖某个文件、
   需求含糊到会明显影响结果。**猜错方向的代价远大于多问一句。**
-  但也别滥用：能自己查清楚的（读文件、搜代码、跑命令）就先自己查。
+  这条**只管「问人」**：能自己查清楚的（读文件、搜代码、跑命令）就先自己查。
 
 ★ **任务复杂时，先 `EnterPlanMode` 拿个方案再动手。**
   什么算复杂：要改三个以上文件、要动架构、要做技术选型、你心里没底。
   简单任务（改个错字、跑条命令、读个文件）直接做，别为了走流程而走流程。
 
-★ **三步以上的活，先 `TodoWrite` 列个清单，之后每完成一步更新一次。**
-  这既是给用户看的进度，也是给你自己记的账 —— 长任务里你很容易忘了还剩哪几件。
+★ **要动三步以上（哪怕每一步都很简单），先 `TodoWrite` 列个清单**，
+  之后每完成一步更新一次。
+
+  ⚠️ **这条和上面那条 AskUserQuestion 是两回事**：
+     · `AskUserQuestion` 是**问人** —— 能自己查清楚的就别去烦用户；
+     · `TodoWrite` 是**给自己记账** —— 跟「能不能自己查」**没关系**。
+       就算每一步都只是读个文件、跑条命令，只要有三步以上，也该先列清单。
+       实测：把「能自己查的就先自己查」套到 TodoWrite 上，模型就再也不列清单了
+       （给个三步任务，它直接闷头开干）。
+     · 清单是给用户看的进度，也是给你自己记的账 —— 长任务里很容易忘了还剩哪几件。
 
 ★ **工具名必须和「可用工具」清单里的一字不差。** 尤其注意：这台机器上跑命令的
   工具叫 `PowerShell`，**不叫 `Bash`**。名字写错那个调用会被直接丢弃，整轮白费。
@@ -574,15 +582,24 @@ def _norm_tool(obj):
     """把各种写法的单个工具调用归一成 {'name':..., 'input':{...}}。"""
     if not isinstance(obj, dict):
         return None
-    name = obj.get('name') or obj.get('tool') or obj.get('tool_name')
-    if not isinstance(name, str) or not name.strip():
+    # ★ 名字键走共用词汇表（name / tool / tool_name）—— 和 `_looks_like_call`、
+    #   `_MAYBE_CALL_RE` 是同一份。三处各认各的，缝就是这么来的（见词汇表说明）。
+    name = next((obj.get(k) for k in _TOOL_NAME_KEYS
+                 if isinstance(obj.get(k), str) and obj.get(k).strip()), None)
+    if not name:
         return None
     # 参数可能叫 input / arguments / parameters / args —— 各家格式不同
-    for k in ('input', 'arguments', 'parameters', 'args'):
+    for k in _TOOL_PARAM_KEYS:
         v = obj.get(k)
         if isinstance(v, dict):
             return {'name': name.strip(), 'input': v}
-    return {'name': name.strip(), 'input': {}}
+    # ★ 平铺写法：参数直接摊在顶层
+    #       {"tool": "PowerShell", "command": "Get-Location"}
+    #   除名字键/外层键以外的字段全收进 input。**不收就等于把参数丢掉** ——
+    #   调用会以「缺 command」被拦下重试，白烧一个来回（实测见过这个形状）。
+    flat = {k: v for k, v in obj.items()
+            if k not in _TOOL_NAME_KEYS and k not in _TOOL_WRAP_KEYS}
+    return {'name': name.strip(), 'input': flat}
 
 
 def _tools_from(obj):
@@ -608,32 +625,51 @@ def _tools_from(obj):
     return [one] if one else []
 
 
-# 工具调用常见的开头（只列出明确表示「这是工具调用」的键）。
+# ── 工具调用的「键名词汇表」 ────────────────────────────────
 #
-# ⚠️ 刻意**不包含** `{"name"` —— 太宽泛了：任何带 name 字段的 JSON 都会命中，
-#    正常回答里举个 {"name": "张三", "age": 18} 的例子就会被误判成工具调用。
-_TOOL_MARKERS = ('{"tool_use"', '{ "tool_use"', '{"tool_calls"', '{ "tool_calls"',
-                 '{"tool_call"')
+# ★ **三处识别必须共用这一份**：`_looks_like_call()`（对象级判断）、
+#   `_MARKER_RE`（文本里扫候选位置）、`looks_broken()`（兜底重试）。
+#   各写各的就会长出缝来 —— 这个项目已经在「同一个职责两份实现」上栽过四次
+#   （前端序列、工具识别表、流式字节写入、以及这次的**名字键**）：
+#   **改了一份、忘了另一份，而且失败得很安静。**
+_TOOL_WRAP_KEYS = ('tool_use', 'tool_calls', 'tool_call', 'tools_use')
+# ★ 名字键**必须和 `_norm_tool` 认的那套完全一致**（它收 name / tool / tool_name）。
+#   实测（听刻会话 2026-10-03 23:31）：`_norm_tool` 明明认 `obj.get('tool')`，
+#   而标记表和 `_looks_like_call` 只认 `name` —— 于是
+#       {"tool": "PowerShell", "input": {"command": "..."}}
+#   参数**是嵌套的、完全合规**，却从来轮不到 `_norm_tool` 去看它一眼。
+_TOOL_NAME_KEYS = ('name', 'tool', 'tool_name')
+_TOOL_PARAM_KEYS = ('input', 'arguments', 'parameters', 'args')
+
+# 「平铺」写法用的参数键：模型偶尔把参数直接摊在顶层
+#     {"tool": "PowerShell", "command": "Get-Location"}
+# 只收**工具专用**的那几个。`description` / `content` 这种太通用的**不收** ——
+# 正常回答里举 JSON 例子经常带它们，收进来就是把回答误判成工具调用。
+_TOOL_FLAT_KEYS = ('command', 'file_path', 'new_string', 'old_string')
 
 
-# 「抠夹带工具调用」另用一套 —— 比 _TOOL_MARKERS 多一个**裸写法** `{"name"`。
+# 「这段文本里**可能**藏着工具调用」的结构判据。
 #
-# ★ 为什么裸写法只在**这里**放开、不能并进 _TOOL_MARKERS：那一份还兼着
-#   「这段文字像不像在试图调工具」的判断（`looks_broken` 在用），太宽会把正常
-#   回答误判成坏调用、白重试一轮。而这里每一步都有 `_looks_like_call()` 兜底 ——
-#   它要求同时有 name **和字典类型的** input/arguments，正常回答里举的例子
-#   （`{"name": "张三", "age": 18}`）根本过不了，所以是安全的。
+# ★ 它只回答「值不值得停下来试一次」，**不回答「是不是」** —— 在**解析**那条
+#   路上，认不认由 `_looks_like_call()` 兜底，所以放宽空白和键名不增加误判面。
 #
-# ★ 实测踩过（用户真实会话）：
-#       我先看一下目录结构。
-#       {"name": "PowerShell", "arguments": {"command": "..."}}
-#   —— **叙述 + 裸写法**。整段既不以 `{` 开头、也没有 tool_use 标记，于是抠不出来、
-#   `looks_broken` 也放行，这坨 JSON 就被当成「回答」交出去 —— Claude Code 没有
-#   工具可调，这一轮直接结束。**这是加了叙述功能之后才出现的新形状**：
-#   两个识别口子原本各自都够用，是「叙述 + 裸写法」把它们之间的缝露出来了。
-_EMBED_MARKERS = _TOOL_MARKERS + ('{"name"', '{ "name"')
+# ★ 但 `looks_broken()` 那条路**没有这层兜底**（它就是最后一道），所以那边
+#   不能直接拿这个正则当结论 —— 它得先配平、解出对象来问 `_looks_like_call()`，
+#   只有**所有候选都解不出来**时才退回文本级（见那里的 ④ / ⑤）。
+#   同一个正则，在两个位置承担的责任不一样 —— 这一点当初「拆成两张表」
+#   就是这个道理，别看到现在共用一份就以为可以随手再放宽。
+#
+# ★ 为什么是正则、而不是早先那几个字面量：`{"name"` / `{ "name"` 只认「紧跟」
+#   和「一个空格」。而模型是会 pretty-print 的：
+#       {
+#         "name": "AskUserQuestion",
+#   这样一个都命中不了，扫描根本不会去看那个位置。实测（听刻会话 23:31）：
+#   同一段文本只差一个换行加缩进，一个废一个通，**用户那一轮直接结束**。
+_MAYBE_CALL_RE = re.compile(
+    r'\{\s*"(?:%s)"' % '|'.join(_TOOL_WRAP_KEYS + _TOOL_NAME_KEYS))
 
-_MARKER_RE = re.compile('|'.join(re.escape(m) for m in _EMBED_MARKERS))
+# `_find_tool_call_span` 靠它按位置扫候选（兼容旧名）
+_MARKER_RE = _MAYBE_CALL_RE
 
 
 def _find_tool_call_span(text):
@@ -802,15 +838,27 @@ def _looks_like_call(obj):
 
     用于「夹带」场景，要求比外层解析更严 —— 因为这里是在一段普通文字里找，
     误判的代价是**把正常回答变成工具调用**，比漏判严重得多。
+
+    ★ 键名一律走共用词汇表（见 `_TOOL_WRAP_KEYS` 上面那段）。这里原先只认
+      `name`，而 `_norm_tool` 认 name / tool / tool_name 三个 ——
+      **缝就是这么来的**：一种写法明明能归一化，却永远轮不到它被看见。
     """
     if not isinstance(obj, dict):
         return False
-    if any(k in obj for k in ('tool_use', 'tool_calls', 'tool_call', 'tools_use')):
+    if any(k in obj for k in _TOOL_WRAP_KEYS):
         return True
-    # 裸写法必须**同时**有 name 和参数字典；光有 name 不算
-    return bool(obj.get('name')) and any(
-        isinstance(obj.get(k), dict)
-        for k in ('input', 'arguments', 'parameters', 'args'))
+    # 裸写法必须**同时**有工具名和参数；光有 name 不算（正常回答里举例太多）
+    has_name = any(isinstance(obj.get(k), str) and obj.get(k).strip()
+                   for k in _TOOL_NAME_KEYS)
+    if not has_name:
+        return False
+    # ① 参数字典（我们教的 input、OpenAI 的 arguments 都算）
+    if any(isinstance(obj.get(k), dict) for k in _TOOL_PARAM_KEYS):
+        return True
+    # ② 平铺写法：名字键 + **工具专用**的参数键同框。`_TOOL_FLAT_KEYS` 只收
+    #    command / file_path / new_string / old_string —— 正常回答里举例
+    #    （`{"name": "张三", "age": 18}`）过不了这一关，所以放开它是安全的。
+    return any(isinstance(obj.get(k), str) for k in _TOOL_FLAT_KEYS)
 
 
 def _extract_embedded_tools(text):
@@ -971,17 +1019,58 @@ def looks_broken(raw):
     if t.startswith('{') and not t.endswith('}'):
         return True
 
-    # ② 判定「像不像在尝试调工具」必须认**带花括号的标记**（{"tool_use" 这种），
+    # ② 判定「像不像在尝试调工具」必须认**带花括号的键**（{"tool_use" 这种），
     #    不能只认「文本里出现了 tool_use 这个词」—— 那样模型在正常回答里提一句
     #    「我不会输出 tool_use」就会被误判成坏调用，白重试一轮（踩过）。
     #
     #    但也不能**只**认「以 { 开头」：模型很爱先解释一句、再把调用附在后面，
     #    那种混合输出同样得触发重试，否则用户看到的就是一坨 JSON 文本。
-    if not (t.startswith('{') or any(m in t for m in _TOOL_MARKERS)):
+    #
+    #    ★ 判据走 `_MAYBE_CALL_RE`（共用词汇表 + 容忍空白）。早先这里是几个
+    #      字面量（`{"name"` / `{ "name"`），pretty-print 成 `{\n  "name":` 就
+    #      一个都命中不了 —— 解析漏、兜底也漏，两头都放行（缺陷 48）。
+    if not (t.startswith('{') or _MAYBE_CALL_RE.search(t)):
         return False
-    # 两种风格都算：我们的 tool_use/input，和 OpenAI 的 tool_calls/arguments
-    return ('"tool_use"' in t or '"tool_calls"' in t
-            or ('"name"' in t and ('"input"' in t or '"arguments"' in t)))
+
+    # ③ 有明确的外层键（tool_use / tool_calls / …）—— 只可能是想调工具
+    if any('"%s"' % k in t for k in _TOOL_WRAP_KEYS):
+        return True
+
+    # ④ 把候选位置的 JSON 配平、解出来，问 `_looks_like_call()`
+    #    —— **和「抠夹带调用」用的是同一个判据**，不另立一套。
+    #
+    #    ★ 为什么不能停在文本级的关键字同现（这是我自己踩的）：正常回答里
+    #      举例  {"name": "张三", "input": "值"}  ——  `input` 是**字符串不是
+    #      字典**，根本不像调用。可只要按「文本里同时出现 name 和 input」判，
+    #      它就被当成坏调用 → 白重试一轮。自测的钉子用例当场抓到了这条回归。
+    #    ★ 只要有一个候选**解出来了**，就以对象级判据为准、不再往下退 ——
+    #      否则上面那个例子会从 ⑤ 漏回来（同一个误判换个地方发生）。
+    for m in _MAYBE_CALL_RE.finditer(t):
+        idx = m.start()
+        depth = 0
+        for i in range(idx, len(t)):
+            c = t[i]
+            if c == '{':
+                depth += 1
+            elif c == '}':
+                depth -= 1
+                if depth == 0:
+                    obj = _loads_lenient(t[idx:i + 1])
+                    if isinstance(obj, dict):
+                        return _looks_like_call(obj)
+                    break                 # 这一段解不出来 → 试下一个候选
+
+    # ⑤ 所有候选都配不出平 / 解不出来 —— 那是**真写坏了**（被截断、转义炸了）。
+    #    这时候做不了对象级判断，只能退回文本级：键词对得上就算。
+    #
+    #    ★ 这一支是**兜底重试**，保证「宁可白重试一轮，也绝不把一坨 JSON
+    #      当回答交出去」。把失败伪装成「回答」是最坏的一种失败：看起来像成功，
+    #      于是上游不会重试、用户只能手打「继续」，日志还干干净净
+    #      （缺陷 31 的教训，这次换了个入口）。
+    has_name = any('"%s"' % k in t for k in _TOOL_NAME_KEYS)
+    has_params = any('"%s"' % k in t
+                     for k in _TOOL_PARAM_KEYS + _TOOL_FLAT_KEYS)
+    return has_name and has_params
 
 
 # 模型（尤其 Claude 系）习惯把「跑命令」那个工具叫 `Bash` —— 它的训练里就是这名字。
@@ -1011,6 +1100,30 @@ def apply_tool_aliases(parsed, tools):
         ds.log(f'[提示] 工具名认错了，自动改名：{"、".join(changed)}')
         return ('tools', out, parsed[2])
     return parsed
+
+
+def parse_and_align(raw, tools):
+    """
+    **解析模型回复的唯一入口**：先 parse_reply，再把认错的工具名改对。
+
+    ★ 为什么要收成一个入口：`apply_tool_aliases(parse_reply(...))` 原先只写在
+      **主路径**上，**重试路径漏了** —— 而重试恰恰是最容易写出 `Bash` 的地方
+      （模型被要求把刚才那个调用重发一遍时，更依赖训练里的老名字）。
+      实测日志对得上：
+
+          02:30:12 [重试] 第 1/2 次：输出像是坏掉的工具调用，重新问一次
+          02:30:23 [警告] 模型编造了工具 ['Bash']，可用的有 [...]… 丢弃
+          02:30:23 [回答] 42 字          ← 「请换个方式提问」当回答，这一轮结束
+
+      漏掉的后果不只是白烧一次重试。更坏的是**混合调用**：`[Bash, Read]` 里
+      `Bash` 会被当成编造的名字**静默丢掉**，那条命令永远不执行 ——
+      而模型以为自己跑了，接着往下走。
+
+    ★ 收成入口而不是「记得两处都改」：这是这个项目反复犯的病（同一个职责
+      有两份实现，改一份忘一份）。现在全仓只有这里调 parse_reply，
+      加第三个解析点时也没法再漏 —— selftest 用 AST 钉住了这一点。
+    """
+    return apply_tool_aliases(parse_reply(raw), tools)
 
 
 def should_retry(parsed, tools):
@@ -1178,17 +1291,20 @@ def build_delta_prompt(new_msgs):
             #   （TOOL_GUIDANCE）只在会话第一轮出现。这里不重复一句的话，
             #   模型从第二轮起就把这些工具忘光了。
             '（有岔路口要人拍板 → 用 AskUserQuestion 问，别自己猜；'
-            '复杂的活 → 先 EnterPlanMode 拿方案；三步以上 → 先 TodoWrite 列清单。）')
+            '复杂的活 → 先 EnterPlanMode 拿方案；三步以上 → 先 TodoWrite 列清单；'
+            '工具名照抄清单 —— 跑命令那个叫 `PowerShell`，不叫 `Bash`。）')
 
 
 def ask_web(prompt, goto_url=None, think=None, attachments=None,
-            start_limit=None, total_limit=None, key=None, search=None):
+            start_limit=None, total_limit=None, key=None, search=None,
+            skip_toggles=False, on_delta=None):
     """
     goto_url=None → 开新对话；否则跳回指定的网页对话。
     think/search=None → 用当前全局开关；True/False → 本次强制。
     返回 (回答原文, 当前对话的 URL)
 
-    ★ `search` 必须留在**参数表末尾**。底下那个重试调用点是**位置传参**
+    ★ `search` 必须留在**参数表末尾**（`skip_toggles` 只能加在它后面）。
+      底下那个重试调用点是**位置传参**
       （`(prompt + reason, None, think, attach, ...)`），往中间插一个参数会让
       attachments 静默错位；而且 selftest 用 AST 检查「第 4 个位置参数是
       attachments」来防止重试路径漏传附件 —— 错位会让那层保护**静默失效**。
@@ -1206,9 +1322,16 @@ def ask_web(prompt, goto_url=None, think=None, attachments=None,
         prompt, think, new_chat=True, attachments=attachments,
         navigate_to=goto_url, start_limit=start_limit, total_limit=total_limit,
         # key = 会话 id → 每个 dsc 会话用自己的标签页
-        key=key, search=search)
-    if err:
+        key=key, search=search, skip_toggles=skip_toggles, on_delta=on_delta)
+    if err and err != ds.TRUNCATED_WARN:
         raise RuntimeError(err)
+    # ★ TRUNCATED_WARN **不是失败**，是「这轮可能是半截」的提醒 ——
+    #   绝不能在这里 raise（那会把本来能用的回答变成 500）。
+    #   它只记一行日志，让下次排查能一眼看出这轮为什么短。
+    #   真正该不该重试，由下面的 retry_reason(parsed, tools) 按解析结果判。
+    if err == ds.TRUNCATED_WARN:
+        ds.log('[续写] 这一轮可能被截断，但先按正常流程解析；'
+               '缺长字段的话重试会接管')
     # ★ URL 必须在【发出消息之后】取 —— 发之前页面还是 chat.deepseek.com/ 根地址，
     #   只有发出第一条消息后才会变成 /a/chat/s/<uuid> 这种真正的对话地址。
     return text, page.url
@@ -1257,6 +1380,75 @@ def to_anthropic_text(text, model='deepseek-web'):
         'stop_reason': 'end_turn', 'stop_sequence': None,
         'usage': {'input_tokens': 0, 'output_tokens': 0},
     }
+
+
+def _sse_event(name, data):
+    """单个 SSE 事件的字节。"""
+    return ('event: %s\ndata: %s\n\n'
+            % (name, json.dumps(data, ensure_ascii=False))).encode('utf-8')
+
+
+class DeltaWriter:
+    """
+    把「累积文本的前缀」转成 SSE 的**差量**事件，边收边写。
+
+    ★ 为什么需要它：ds.wait_answer 的 on_delta 给的是**当前全文的前缀**
+      （每次都重新给一遍全文的开头），而 SSE 的 text_delta 语义是
+      「这次新增的片段」。所以要自己记住上次吐到哪了、只发差量。
+
+    ★ 为什么不会吐重：只认「比上次长」的情况。网页重渲染让文本变短时
+      ds 那边已经过滤了，这里再兜一道（短了就原样返回，不发）。
+    """
+    def __init__(self, handler, index=0):
+        # ★ 持有 **handler** 而不是裸的 wfile —— 所有写入都必须走
+        #   handler._raw_write（它负责 chunked 编码）。
+        #   踩过：这里原先自己拿 wfile.write 裸写，而响应是 chunked 的，
+        #   结果混了两种格式，客户端报
+        #     ValueError: invalid literal for int() with base 16: b'event: ...'
+        #   —— 它把 SSE 那行当成块长度了。只留一个写入口就不会再犯。
+        self.handler = handler
+        self.index = index
+        self.shown = ''          # 已经吐出去的（累积）
+        self.open = False
+
+    def _raw(self, b):
+        self.handler._raw_write(b)
+
+    def text(self, full_prefix):
+        if not full_prefix or len(full_prefix) <= len(self.shown):
+            return
+        delta = full_prefix[len(self.shown):]
+        if not self.open:
+            self._raw(_sse_event('content_block_start', {
+                'type': 'content_block_start', 'index': self.index,
+                'content_block': {'type': 'text', 'text': ''}}))
+            self.open = True
+        self.shown = full_prefix
+        self._raw(_sse_event('content_block_delta', {
+            'type': 'content_block_delta', 'index': self.index,
+            'delta': {'type': 'text_delta', 'text': delta}}))
+
+    def close_text(self):
+        if self.open:
+            self._raw(_sse_event('content_block_stop', {
+                'type': 'content_block_stop', 'index': self.index}))
+            self.open = False
+            self.index += 1
+        return self.index
+
+
+def stream_headers(handler):
+    """
+    开一个流式响应。
+
+    ★ 必须用 chunked：原来那套「先算 Content-Length 再发」在这里行不通 ——
+      要发的时候长度还不知道（内容还在生成）。HTTP/1.1 有 chunked 正好办这事。
+    """
+    handler.send_response(200)
+    handler.send_header('Content-Type', 'text/event-stream; charset=utf-8')
+    handler.send_header('Cache-Control', 'no-cache')
+    handler.send_header('Transfer-Encoding', 'chunked')
+    handler.end_headers()
 
 
 def sse_events(msg):
@@ -1309,6 +1501,111 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header('Content-Length', str(len(body)))
         self.end_headers()
         self.wfile.write(body)
+
+    def _raw_write(self, b):
+        """
+        往流式响应里写一段，按 HTTP/1.1 的 **chunked** 编码包一层。
+
+        ★ 为什么手写分块：BaseHTTPRequestHandler 不自动做 chunked。
+          格式是「十六进制长度\r\n 数据 \r\n」，最后用一个 0 长度的块收尾。
+        """
+        self.wfile.write(('%x\r\n' % len(b)).encode('ascii') + b + b'\r\n')
+        try:
+            self.wfile.flush()
+        except Exception:
+            pass
+
+    def _raw_write_end(self):
+        """chunked 的结束块（0 长度）。★ 和 _raw_write 放一起 ——
+        它们都是「往流式响应里写原始字节」这件事，散开迟早漏一个。"""
+        try:
+            self.wfile.write(b'0\r\n\r\n')
+            self.wfile.flush()
+        except Exception:
+            pass
+
+    def _finish_stream(self, dw, msg):
+        """
+        流式响应的收尾：关 text 块、补 tool_use 块、发 message_stop。
+
+        ★ 为什么叙述不会重复：`dw.shown` 记着已经吐出去多少。如果解析结果里
+          的 text 块（就是 prose）比已吐的**长**，说明还有没吐完的，补上；
+          比已吐的短或相等，说明已经吐全了，一个字都不再发。
+          （判断的是 text 块 —— tool_use 块不该走文本通道。）
+        """
+        try:
+            text = ''.join(b.get('text', '') for b in msg['content']
+                           if b.get('type') == 'text')
+            if text and len(text) > len(dw.shown):
+                dw.text(text)
+            idx = dw.close_text()
+            for blk in msg['content']:
+                if blk.get('type') != 'tool_use':
+                    continue
+                self._raw_write(_sse_event('content_block_start', {
+                    'type': 'content_block_start', 'index': idx,
+                    'content_block': {'type': 'tool_use', 'id': blk['id'],
+                                      'name': blk['name'], 'input': {}}}))
+                self._raw_write(_sse_event('content_block_delta', {
+                    'type': 'content_block_delta', 'index': idx,
+                    'delta': {'type': 'input_json_delta',
+                              'partial_json': json.dumps(blk['input'],
+                                                         ensure_ascii=False)}}))
+                self._raw_write(_sse_event('content_block_stop', {
+                    'type': 'content_block_stop', 'index': idx}))
+                idx += 1
+            self._raw_write(_sse_event('message_delta', {
+                'type': 'message_delta',
+                'delta': {'stop_reason': msg['stop_reason'], 'stop_sequence': None},
+                'usage': {'output_tokens': 0}}))
+            self._raw_write(_sse_event('message_stop', {'type': 'message_stop'}))
+            self._raw_write_end()
+        except Exception as e:
+            ds.log(f'[流式] 收尾出错：{str(e)[:80]}')
+
+    def _fail(self, code, message, streaming=False, dw=None):
+        """
+        报错的**唯一出口**。
+
+        ★ 为什么必须收成一个口子：流式的头一旦发出去（200 + chunked），响应就
+          已经提交了 —— 此时再 `send_response(500)` 会把 HTTP 状态行写进
+          **响应体**里，客户端的 chunked 解码器拿它当块长度解析，直接炸。
+          实测（`_gap_probe.py`）收到的字节：
+
+              HTTP/1.1 200 X
+              Transfer-Encoding: chunked
+              36
+              event: message_start
+              ...
+              HTTP/1.1 500 X          ← 混进响应体的第二个状态行
+              Content-Length: 82
+              {"type": "error", ...}
+
+          客户端读下一个块长度时是 `int('HTTP/1.1 500 X', 16)` → ValueError。
+          **这和 DeltaWriter 裸写那次是同一个病**（往已提交的响应里混格式），
+          只是入口不同 —— 收成一个出口才不会再有第三个。
+
+          流式下只能用 SSE 的 `error` 事件报错：那是 Anthropic 流式协议本来
+          就有的东西，客户端会把它转成 APIError，行为和非流式的 500 一致。
+
+        ★ 为什么加 `streaming` 参数，而不是拿 `dw is None` 当判据：
+          `stream_headers()` 和 `dw = DeltaWriter(self)` 之间还夹着一次
+          `_raw_write(message_start)`。那一步若抛异常，头已经出去了而 dw 还是
+          None —— 拿 dw 当判据就会走错分支，正好在最需要它的时候写坏响应。
+        """
+        if streaming:
+            try:
+                if dw is not None:
+                    dw.close_text()
+                self._raw_write(_sse_event('error', {
+                    'type': 'error',
+                    'error': {'type': 'api_error', 'message': message}}))
+                self._raw_write_end()
+            except Exception as e:
+                ds.log(f'[流式] 报错收尾也失败了：{str(e)[:80]}')
+            return
+        self._json(code, {'type': 'error',
+                          'error': {'type': 'api_error', 'message': message}})
 
     def _error(self, code, msg, kind='invalid_request_error'):
         self._json(code, {'type': 'error',
@@ -1463,12 +1760,30 @@ class Handler(BaseHTTPRequestHandler):
         #   关键词法会误判：该搜的没搜、不该搜的乱搜还白等 30 秒。
         search = _search_state['on'] or ('search' in str(req.get('model') or '').lower())
 
+        # ★ 流式（伪）：把 wait_answer 轮询到的增量实时吐出去。
+        #   只有请求要 stream 时才挂 —— 不要流的时候这个回调纯属浪费。
+        #   ★ 重试路径**不挂**（见下面那处），它吐的东西可能马上被丢弃重来。
+        #   ★ `streaming` 单独记账，**不拿 `dw is None` 代替**：头和 dw 之间
+        #     还夹着一次 `_raw_write`，那一步抛异常时头已经出去了。见 _fail()。
+        streaming = bool(req.get('stream'))
+        dw = None
+        on_delta = None
+        if streaming:
+            stream_headers(self)
+            self._raw_write(_sse_event('message_start', {
+                'type': 'message_start', 'message': {
+                    'id': 'msg_' + uuid.uuid4().hex[:20], 'type': 'message',
+                    'role': 'assistant', 'model': req.get('model', 'deepseek-web'),
+                    'content': [], 'stop_reason': None, 'stop_sequence': None,
+                    'usage': {'input_tokens': 0, 'output_tokens': 0}}}))
+            dw = DeltaWriter(self)
+            on_delta = dw.text
         try:
-            raw, web_url = ask_web(prompt, goto, think, attach, key=sid, search=search)
+            raw, web_url = ask_web(prompt, goto, think, attach, key=sid, search=search,
+                                   on_delta=on_delta)
         except Exception as e:
             ds.log(f'[失败] {e}')
-            self._json(500, {'type': 'error', 'error': {'type': 'api_error',
-                                                        'message': str(e)}})
+            self._fail(500, str(e), streaming=streaming, dw=dw)
             return
 
         # ★ 模型申请开开关（[[SEARCH]] / [[THINK]]）—— 真实 API 那边是模型自己
@@ -1487,6 +1802,9 @@ class Handler(BaseHTTPRequestHandler):
                                      ('深度思考', want_think)) if w]
             ds.log(f'[申请] 模型要求打开「{"、".join(opened)}」—— 开好后重发同一问题')
             try:
+                # ★ 这一轮**不挂 on_delta**：它是在同一对话里重发问题，
+                #   增量会从「上一轮已经吐过的位置」接着来，语义乱。
+                #   反正只多等一轮，不值得为它搞复杂。
                 raw, web_url = ask_web(
                     '（已为你打开%s。请重新回答上面那个问题。）' % '、'.join(opened),
                     web_url,                      # ← 同一个网页对话，不新开
@@ -1521,7 +1839,7 @@ class Handler(BaseHTTPRequestHandler):
 
         # 模型把工具名认错了（比如把 PowerShell 叫成 Bash）→ **先改名再往下走**，
         # 这样重试判据和长字段检查看到的都是正确的名字。
-        parsed = apply_tool_aliases(parse_reply(raw), tools)
+        parsed = parse_and_align(raw, tools)
 
         # 这条回复有没有「不能就这么发上去」的毛病 → 有就重问。
         # 两类毛病（JSON 写坏了 / 工具调用缺长字段）见 retry_reason()。
@@ -1592,8 +1910,20 @@ class Handler(BaseHTTPRequestHandler):
                     #   比搜索所需的时间（30 秒起步）还短，透传进去必然报
                     #   「回答没有开始」，然后白白浪费一次重试。重试是修格式，
                     #   跟联不联网没关系。
-                    start_limit=25.0, total_limit=60.0, key=sid, search=False)
-                p2 = parse_reply(raw2)
+                    start_limit=25.0, total_limit=60.0, key=sid, search=False,
+                    # ★ 跳过开关对齐 —— 重试是去修 JSON 格式的，跟开关状态
+                    #   毫无关系。不跳过的话，开关一次瞬时抖动就会把整个
+                    #   重试废掉（set_toggle 的「强开找不到就抛错」语义），
+                    #   用户直接吃 500。实测踩过：
+                    #     03:03:33 [重试] 第 1/2 次：Write 缺 content……
+                    #     03:03:35 [重试] 失败：「智能搜索」开关切换失败
+                    #     03:03:35 [重试] 2 次都没修好，返回 500
+                    skip_toggles=True)
+                # ★ 重试结果必须走**同一个**入口。漏了这里就是「改了主路径、
+                #   忘了重试路径」：重试产出的 `Bash` 不被改名，白烧掉这一次
+                #   重试，两次都这样就是 500。实测日志正是这个形状（见
+                #   parse_and_align 的说明）。
+                p2 = parse_and_align(raw2, tools)
                 if not retry_reason(p2, tools):
                     parsed, raw = p2, raw2
                     # ★ web_url 刻意不更新 —— 重试用的是临时对话，
@@ -1617,10 +1947,10 @@ class Handler(BaseHTTPRequestHandler):
         if retry_reason(parsed, tools):
             ds.log('[重试] %d 次都没修好，返回 500 交给上游重试。原始回复：%r'
                    % (MAX_RETRIES, raw[:400]))
-            self._json(500, {'type': 'error', 'error': {
-                'type': 'api_error',
-                'message': '模型这一轮的工具调用被引号转义弄坏了，重试 %d 次仍没修好。'
-                           '这一轮没有可用的工具调用，请重试。' % MAX_RETRIES}})
+            self._fail(500,
+                       '模型这一轮的工具调用被引号转义弄坏了，重试 %d 次仍没修好。'
+                       '这一轮没有可用的工具调用，请重试。' % MAX_RETRIES,
+                       streaming=streaming, dw=dw)
             return
 
         # 过滤掉模型凭空编的工具名（实测见过 noop / no_tool_available）。
@@ -1662,13 +1992,9 @@ class Handler(BaseHTTPRequestHandler):
             msg = to_anthropic_text(parsed[1], model=req.get('model', 'deepseek-web'))
 
         if req.get('stream'):
-            body = sse_events(msg).encode('utf-8')
-            self.send_response(200)
-            self.send_header('Content-Type', 'text/event-stream; charset=utf-8')
-            self.send_header('Cache-Control', 'no-cache')
-            self.send_header('Content-Length', str(len(body)))
-            self.end_headers()
-            self.wfile.write(body)
+            # 流式：头已经发过了、叙述也已经边等边吐过了。这里只收尾 ——
+            # 关掉 text 块，把 tool_use 块补上（如果有），最后 message_stop。
+            self._finish_stream(dw, msg)
         else:
             self._json(200, msg)
 

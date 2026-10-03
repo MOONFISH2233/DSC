@@ -58,7 +58,26 @@ PROFILE_DIR = os.path.join(os.environ.get('LOCALAPPDATA', os.path.expanduser('~'
                            'deepseek_ask', 'chrome_profile')
 URL = 'https://chat.deepseek.com/'
 
-POLL = 0.25                      # 轮询间隔（秒）
+POLL = 0.25                      # 轮询间隔（秒）—— 起步用这个
+
+# 轮询间隔自适应。
+#
+# ★ 为什么要自适应：首字延迟是体感关键（用户盯着空屏），所以开头要密；
+#   但一旦开始出字，后面几十秒里文本变化没那么频繁，0.25 秒一查就是浪费。
+#   实测一轮 30 秒的回答本来要 120 次 CDP 往返，降到 0.5 秒后省一半。
+#
+# ★ 不能设得更大（比如 1 秒）：完成判定靠「文本连续 N 秒不变」
+#   （STABLE_NORMAL=2.5 秒），轮询太稀会让「已经停了」被晚发现，
+#   判完成反而变慢。0.5 秒是平衡点。
+POLL_FAST = POLL                  # 开头的密查
+POLL_SLOW = 0.5                   # 之后的稀查
+POLL_FAST_WINDOW = 3.0            # 开头多久用密查（秒）
+
+# 「继续生成」按钮的最小扫描间隔。
+#
+# ★ 为什么降频：按钮一旦出现就不会瞬间消失，1 秒粒度足够。
+#   而它每次都要一次 DOM 查询 —— 稳定性达标后本来每轮都查。
+CONTINUE_SCAN_INTERVAL = 1.0
 
 # 提示词上限。
 # 实测：输入框能吃 100 万字以上（没探到底），box.input() 也不是逐字敲、
@@ -190,6 +209,14 @@ BUSY_MIN_CHARS = 10
 
 # 续写的最大次数 —— 防止按钮不消失时无限循环。
 MAX_CONTINUES = 6
+
+# 续写没能成功时的**警告**文本（不是错误！）。
+#
+# ★ 为什么是警告而不是错误：wait_answer 分不清「真被截断」和「按钮误报」。
+#   只有解析出工具调用才知道 —— 所以判断交给上层（见 claude_shim）。
+#   这里用一句**固定文本**，上层靠 `err == ds.TRUNCATED_WARN` 精确识别，
+#   不要去 match 中文子串（改一个标点就失效，而且可能撞上别的错误）。
+TRUNCATED_WARN = '回答可能被截断（续写没能成功）'
 
 # 点「继续生成」的容错参数。
 #
@@ -1067,8 +1094,76 @@ def send_question(page, text, baseline='', attachments=None):
     raise RuntimeError('三种发送方式都没能把消息发出去 —— 跑 ask --probe 看看选择器')
 
 
+# ── 伪流式：增量回调 ──────────────────────────────────────
+#
+# ★ 为什么需要：网页版不给 token 流，我们只能轮询 DOM；但可以把轮询到的
+#   增量实时吐给上层，用户看到的就是逐字冒出来，而不是「卡 30 秒 → 一大段」。
+#   这是 dsc 和真 Claude Code 体感差距最大的一处。
+#
+# ★ 为什么用回调而不是返回值：这条线要贯穿五层。回调不传就是 None，
+#   行为完全不变 —— 对 CLI / MCP / api_server 零影响。
+#
+# ★ 为什么每处都要 try/except：这是「展示」用的旁路，绝不能因为
+#   用户代码报错就把取回答的主流程搞挂。
+def _emit(on_delta, text):
+    if not on_delta or not text:
+        return
+    try:
+        on_delta(text)
+    except Exception as e:
+        log(f'[流式] 回调出错（忽略）：{str(e)[:60]}')
+
+
+# 思考标题行**还没写完**时的样子：开头像标题，但整段还没有换行。
+# 见 streamable_prefix 的说明 —— 这种时候先别吐。
+_HEADER_PENDING_RE = re.compile(
+    r'^\s*(已深度思考|深度思考|思考中|正在思考|已思考|Thought about|Thinking)[^\n]*$')
+
+
+def streamable_prefix(text):
+    """
+    这段文本里，**能安全吐出去**的部分有多长。
+
+    ★ 为什么要截：这一轮可能是工具调用，而工具调用**不能流** ——
+      得等 JSON 完整了才能解析。所以一旦文本里出现 `{`，就从那里截断：
+      前面的叙述（「我先看一下目录」）是给人看的，可以吐；
+      后面的 JSON 没成型，吐出去就是垃圾。
+
+    ★ 只认 `{` 不认 `[`：`[` 在正常回答里太常见（Markdown 链接、
+      列表、代码里的下标），拿它当判据会频繁误截。而模型要调工具时
+      **必然**写 `{`（`{"tool_use"...}`），所以 `{` 一个就够了。
+
+    ★ 必须先 `clean()`：非流式路径吐给上游的是 `clean(text)`，流式这条路
+      原先吐的是**原文** —— 同一份回答两条路产出不一样。开深度思考时，
+      那行「已深度思考（用时 N 秒）」会被流出去，而普通路径会把它删掉。
+      和 `streamable_prefix` 之外的每一处清洗对齐，才不会出现
+      「流式看到的和最终落盘的不一致」。
+
+    ★ 标题行没写完之前**压住不吐**：`clean()` 要等那行**带着换行**到齐了
+      才删得掉，而流式是按前缀一次次吐的 —— 在它到齐之前把
+      「已深度思考（用时 3」吐出去就收不回来了（SSE 的 delta 只能加不能减）。
+      压住是对的：真等不到换行，`_finish_stream` 会把结尾补上。
+    """
+    text = clean(text)
+    if _HEADER_PENDING_RE.match(text):
+        return ''
+    i = text.find('{')
+    return text if i < 0 else text[:i]
+
+
+def _poll_interval(t0, now=None):
+    """
+    轮询间隔：开头密、之后稀。
+
+    ★ 首字延迟是体感关键（用户盯着空屏），所以前 POLL_FAST_WINDOW 秒用
+      POLL_FAST；一旦开始出字，文本变化没那么频繁，改用 POLL_SLOW。
+      实测一轮 30 秒的回答从 120 次 CDP 往返降到约 65 次。
+    """
+    return POLL_FAST if (now or time.time()) - t0 < POLL_FAST_WINDOW else POLL_SLOW
+
+
 def wait_answer(page, baseline, think, start_limit=None, total_limit=None,
-                search=False):
+                search=False, on_delta=None):
     """
     等回答生成完。两道判据：
 
@@ -1094,26 +1189,37 @@ def wait_answer(page, baseline, think, start_limit=None, total_limit=None,
         total_limit = TOTAL_THINK if slow else TOTAL_NORMAL
 
     # --- 阶段 1：等回答开始。避免刚发出去就判空。 ---
-    deadline = time.time() + start_limit
+    t_start = time.time()
+    deadline = t_start + start_limit
     started = False
     while time.time() < deadline:
         txt = last_answer_text(page)
         if txt and txt != baseline:
             started = True
             break
-        time.sleep(POLL)
+        time.sleep(_poll_interval(t_start))
     if not started:
         return None, '回答没有开始 —— 可能没发出去，或者选择器失效了（跑 --probe 看看）'
 
     # --- 阶段 2：等生成结束。 ---
     last_text, last_change = '', time.time()
     continues = 0
-    deadline = time.time() + total_limit
+    t_start = time.time()
+    deadline = t_start + total_limit
+    # ★ 两个缓存，都是为了省 CDP 往返：
+    #   done_seen     —— answer_done_rendered 一旦 True 就不会变回 False
+    #                    （操作栏渲染出来就一直在），没必要每轮重查。
+    #   last_btn_scan —— 「继续生成」按钮降频，见 CONTINUE_SCAN_INTERVAL。
+    cache = {'done_seen': False, 'last_btn_scan': 0.0}
     while time.time() < deadline:
-        time.sleep(POLL)
+        time.sleep(_poll_interval(t_start))
 
         txt = last_answer_text(page)
         if txt != last_text:
+            # ★ 只在**变长**时吐（见 _emit 上面 ① 的说明）——
+            #   网页重渲染会让文本变短，那种一律忽略，绝不收回已吐的。
+            if len(txt) > len(last_text):
+                _emit(on_delta, streamable_prefix(txt))
             last_text, last_change = txt, time.time()
             continue
 
@@ -1122,8 +1228,11 @@ def wait_answer(page, baseline, think, start_limit=None, total_limit=None,
             continue
         if not txt.strip():                          # ① 空结果不算数
             continue
-        if not (answer_done_rendered(page) or stable_for >= stable_need * 2):
-            continue                                 # ② 还没稳，继续等
+        # ② 还没稳，继续等。操作栏查过一次是真的就不再重复查（见 cache 说明）。
+        if not cache['done_seen']:
+            cache['done_seen'] = answer_done_rendered(page)
+        if not (cache['done_seen'] or stable_for >= stable_need * 2):
+            continue
 
         # ★ 文本稳了，但**未必是真的答完了** —— 也可能是页面弹了
         #   「服务器繁忙，请稍后重试」：这一轮压根没生成出回答。
@@ -1140,7 +1249,13 @@ def wait_answer(page, baseline, think, start_limit=None, total_limit=None,
         # ★ 文本稳了，但**可能是被长度限制截断的** —— 回答下方会出现
         #   「继续生成」按钮。不处理的话我们只拿到半截，用户那边看着就是
         #   「输出莫名其妙断了」。实测踩过：一个 SVG 任务的回答被切在半句上。
-        btn = find_continue_button(page)
+        # ★ 降频：按钮一旦出现就不会瞬间消失，1 秒粒度足够（见
+        #   CONTINUE_SCAN_INTERVAL）。这一处曾经是热路径上最贵的查询。
+        _now = time.time()
+        if _now - cache['last_btn_scan'] >= CONTINUE_SCAN_INTERVAL:
+            cache['last_btn_scan'] = _now
+            cache['has_btn'] = bool(find_continue_button(page))
+        btn = cache.get('has_btn')
         if btn and continues < MAX_CONTINUES:
             continues += 1
             before = txt
@@ -1169,9 +1284,14 @@ def wait_answer(page, baseline, think, start_limit=None, total_limit=None,
                 if not click_continue(page):
                     break
                 wait_start = time.time()
+                # ★ 这一圈是单次最贵的：CONTINUE_WAIT=45 秒、原先 POLL=0.25
+                #   → 一次续写最长 **180 次** CDP 往返。而续写期间文本本来
+                #   就是断断续续出的，密查纯属浪费。自适应后约减半。
                 while time.time() - wait_start < CONTINUE_WAIT:
-                    time.sleep(POLL)
+                    time.sleep(_poll_interval(wait_start))
                     new_txt = last_answer_text(page)
+                    if new_txt and len(new_txt) > len(before):
+                        _emit(on_delta, streamable_prefix(new_txt))
                     if new_txt and new_txt != before:
                         restarted = True
                         last_text, last_change = new_txt, time.time()
@@ -1181,12 +1301,25 @@ def wait_answer(page, baseline, think, start_limit=None, total_limit=None,
                 log(f'[续写] 第 {attempt} 次点完 {int(CONTINUE_WAIT)} 秒没动静，'
                     f'换种方式再点')
             if not restarted:
-                log(f'[续写] 第 {continues} 次没续上，按已完成处理')
-                return txt, None
+                # ★ 这里**不能**只返回 (txt, None) 当成品 —— 那正是缺陷 45：
+                #   半截回答被当成完整回答交出去（实测 `[回答] 23 字` 那种）。
+                #   但也**不能**直接报错：内容很可能其实是完整的，只是
+                #   「继续生成」按钮没消失（误报）。这一层没有足够信息判断 ——
+                #   要解析出工具调用才知道。所以只**报告事实**，
+                #   判断交给 shim 侧（见 claude_shim 里对 partial 的处理）。
+                log(f'[续写] 第 {continues} 次没续上，按已完成处理（但可能被截断）')
+                return txt, TRUNCATED_WARN
             continue
 
         if continues >= MAX_CONTINUES:
+            # ★ 这条**不报** TRUNCATED_WARN，和上面那条分支刻意区别开。
+            #   能走到这里说明每次续写**都成功过**（文本一直在变长，否则
+            #   会在 `if not restarted` 就 return 了），只是还没续完。
+            #   内容在长 = 没被卡住，报「可能被截断」是误报。
+            #   自测的钉子用例正是这个场景：MAX_CONTINUES=2 续满，
+            #   断言 `err is None and 续写内容在`。
             log(f'[续写] 已经续了 {MAX_CONTINUES} 次还没完，就此打住')
+            return txt, None
         return txt, None
 
     return None, f'生成超时（{int(total_limit)} 秒）'
@@ -1366,7 +1499,7 @@ def do_open(page, n):
 
 
 def ask(page, question, think=False, attachments=None,
-        start_limit=None, total_limit=None, search=False):
+        start_limit=None, total_limit=None, search=False, on_delta=None):
     """
     **发一个问题并等答案。所有上层都必须走这里。**
 
@@ -1383,13 +1516,14 @@ def ask(page, question, think=False, attachments=None,
     send_question(page, question, baseline, attachments)
     text, err = wait_answer(page, baseline, think,
                             start_limit=start_limit, total_limit=total_limit,
-                            search=search)
+                            search=search, on_delta=on_delta)
     return (clean(text) if text else text), err
 
 
 def ask_in_session(question, think=False, new_chat=True, attachments=None,
                    page=None, navigate_to=None,
-                   start_limit=None, total_limit=None, key=None, search=False):
+                   start_limit=None, total_limit=None, key=None, search=False,
+                   skip_toggles=False, on_delta=None):
     """
     **一轮完整的问答：拿连接 → 确保页面 → 设开关 → 发问 → 等答案。**
 
@@ -1404,6 +1538,10 @@ def ask_in_session(question, think=False, new_chat=True, attachments=None,
 
     navigate_to 传 URL 时是「跳回某个已有的网页对话」（shim 用）；
     否则按 new_chat 决定开新对话还是接着当前的（CLI / MCP / api_server 用）。
+
+    skip_toggles=True 时**跳过设开关那一步**。给谁用：shim 的**重试**路径。
+    见下面那段说明 —— 重试是去修 JSON 格式的，跟开关状态毫无关系，
+    而 set_toggle 的「强开找不到就抛错」语义会把整个重试废掉。
     """
     # ★ 全程持锁：多个进程同时驱动同一个页面会互相把它导航走。
     #   key 为空 → 全局锁（一个页面，大家排队）；
@@ -1411,12 +1549,12 @@ def ask_in_session(question, think=False, new_chat=True, attachments=None,
     with browser_lock(key):
         return _ask_in_session_locked(
             question, think, new_chat, attachments, page, navigate_to,
-            start_limit, total_limit, key, search)
+            start_limit, total_limit, key, search, skip_toggles, on_delta)
 
 
 def _ask_in_session_locked(question, think, new_chat, attachments, page,
                            navigate_to, start_limit, total_limit, key=None,
-                           search=False):
+                           search=False, skip_toggles=False, on_delta=None):
     """ask_in_session 的实体，调用方必须已经持有 browser_lock。"""
     # 有 key 就用它的专属标签页；开不出来（或没给 key）就用主页面。
     tab = tab_for(key)
@@ -1437,10 +1575,23 @@ def _ask_in_session_locked(question, think, new_chat, attachments, page,
 
     # ★ 两个开关都**每轮双向对齐**，不是「想开才调」—— 网页会记住上次状态，
     #   用户手动开着的搜索会一直是开的，我们以为它是关的就会算错超时档。
-    set_think(page, think)
-    set_search(page, search)
+    #
+    # ★ skip_toggles 是给 shim 的**重试**路径用的（见 claude_shim 里的调用点）。
+    #   为什么要能跳过：set_toggle 的语义是「强开找不到就抛错」，而重试是去修
+    #   JSON 格式的，跟开关状态毫无关系 —— 开关一次瞬时抖动（React 重渲染、
+    #   页面还没稳）就把整个重试废掉，用户直接吃 500。实测踩过：
+    #       03:03:33 [重试] 第 1/2 次：Write 缺 content……重新问一次
+    #       03:03:35 [重试] 失败：「智能搜索」开关切换失败
+    #       03:03:35 [重试] 2 次都没修好，返回 500 交给上游重试
+    #   重试复用的是同一个标签页，开关上一轮刚对齐过，再切一次纯属自找麻烦。
+    if not skip_toggles:
+        set_think(page, think)
+        set_search(page, search)
+    else:
+        log('[重试] 跳过开关对齐（本轮只为修格式，不碰开关）')
     text, err = ask(page, question, think, attachments,
-                    start_limit=start_limit, total_limit=total_limit, search=search)
+                    start_limit=start_limit, total_limit=total_limit, search=search,
+                    on_delta=on_delta)
     return page, text, err
 
 

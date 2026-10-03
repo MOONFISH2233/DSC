@@ -111,6 +111,9 @@ def section(title):
 
 def test_unit():
     import claude_shim as cs
+    # ★ 伪流式 / TRUNCATED_WARN 这些在 deepseek_ask 里，这一节也要用。
+    #   （main() 里也有个 ds_init，但那是另一个作用域 —— 这里得自己导。）
+    import deepseek_ask as ds_init
 
     section('单元 · 回答解析')
 
@@ -463,6 +466,11 @@ def test_unit():
     _d = cs.build_delta_prompt(_msgs)
     check('★ delta 路径也带压缩版引导（否则第二轮起就忘光）',
           'AskUserQuestion' in _d and '不要再调工具' not in _d, _d[:80])
+    # ★ 「工具名照抄清单」也必须进 delta。只在 build_prompt 里的话，模型从
+    #   第二轮起就把「跑命令那个叫 PowerShell」忘了 —— 而写命令恰恰发生在
+    #   后续轮次。这正是第十五轮补 缺陷 34 的同一个坑（规则只在第一轮出现）。
+    check('★ delta 路径也提醒工具名（跑命令那个叫 PowerShell）',
+          'PowerShell' in _d, _d[:150])
 
     section('单元 · 工具名认错（Bash → PowerShell）')
     # ★ 回归（真实使用实测）：模型写对了 PowerShell 命令，**唯独名字叫成了 Bash**
@@ -493,6 +501,56 @@ def test_unit():
                       {'name': 'Read', 'input': {'file_path': 'a'}}], '')
     check('部分名字错时不触发重试（过滤器会留住好的那个）',
           cs.retry_reason(_mix, PS_ONLY) is None)
+
+    # ★ 缺陷 46：**重试路径漏了改名**。原先 `apply_tool_aliases(parse_reply(...))`
+    #   只写在主路径上 —— 而重试恰恰是最容易写出 `Bash` 的地方（模型被要求把
+    #   刚才那个调用重发一遍时，更依赖训练里的老名字）。实测日志正是这个形状：
+    #     02:30:12 [重试] 第 1/2 次：输出像是坏掉的工具调用，重新问一次
+    #     02:30:23 [警告] 模型编造了工具 ['Bash'] … 丢弃 → 42 字回答，这轮结束
+    #   修法是**收成一个入口**（parse_and_align），不是「记得两处都改」。
+    _pa = cs.parse_and_align(
+        '{"tool_use": {"name": "Bash", "input": {"command": "Get-Location"}}}', PS_ONLY)
+    check('★ parse_and_align 会改名（两个解析点共用的那个入口）',
+          _pa[0] == 'tools' and _pa[1][0]['name'] == 'PowerShell', str(_pa[:2])[:120])
+    check('parse_and_align 对普通回答原样返回',
+          cs.parse_and_align('这就是答案。', PS_ONLY)[0] == 'reply')
+
+    section('单元 · 工具调用形状（听刻会话实测的两种漏法）')
+    # ★ 缺陷 48：标记正则不认空白。`{"name"` / `{ "name"` 只认「紧跟」和
+    #   「一个空格」，而模型会 pretty-print：
+    #       {
+    #         "name": "AskUserQuestion",
+    #   —— 一个都命中不了，扫描根本不去看那个位置，整个调用被漏掉、
+    #   当成「回答」交给 Claude Code，**那一轮就此结束**。
+    #   实测 2026-10-03 23:31 听刻会话：同一段文本只差一个换行加缩进，
+    #   一个废一个通（日志 `[回答] 1637 字`）。
+    _pp = ('我先问清楚再动手。\n\n{\n  "name": "AskUserQuestion",\n'
+           '  "arguments": {"questions": []}\n}')
+    _r = cs.parse_reply(_pp)
+    check('★ 裸写法 pretty-print（换行 + 缩进）也要抠得出来',
+          _r[0] == 'tools' and _r[1][0]['name'] == 'AskUserQuestion', str(_r)[:110])
+    check('同一行 / 单个空格那两种写法没被改坏',
+          cs.parse_reply('引言。\n{"name": "AskUserQuestion", "arguments": {"questions": []}}')[0] == 'tools'
+          and cs.parse_reply('引言。\n{ "name": "AskUserQuestion", "arguments": {"questions": []}}')[0] == 'tools')
+
+    # ★ 缺陷 49：`"tool"` 这个键名没进**任何**一张表 —— 而 `_norm_tool` 明明认
+    #   `obj.get('tool')`。两个口子不一致，于是参数**完全合规**的写法
+    #   也从来轮不到被归一化。修法是三处共用一个键名词汇表。
+    _t2 = cs.parse_reply('先确认脚本位置。\n\n{"tool": "PowerShell", "input": {"command": "Get-Location"}}')
+    check('★ {"tool": …, "input": …} 也要认（_norm_tool 一直收这个键）',
+          _t2[0] == 'tools' and _t2[1][0]['name'] == 'PowerShell'
+          and _t2[1][0]['input'] == {'command': 'Get-Location'}, str(_t2[:2])[:110])
+    # 平铺写法：参数直接摊在顶层 —— 不收进 input 就等于**把命令丢掉**，
+    # 调用会以「缺 command」被拦下，白烧一个来回。
+    _t3 = cs.parse_reply('先确认脚本位置。\n\n{"tool": "PowerShell", "command": "Get-Location"}')
+    check('★ 平铺参数要收进 input（不然命令就丢了）',
+          _t3[0] == 'tools' and _t3[1][0]['input'] == {'command': 'Get-Location'},
+          str(_t3[:2])[:110])
+    # ★ 兜底：**解不出来**的（截断 / 转义炸了）必须判成「坏」去重试，
+    #   绝不许泄漏成「回答」。把失败伪装成回答是最坏的一种失败 ——
+    #   上游不会重试、用户只能手打「继续」，而且日志干干净净。
+    check('★ 解不出来的平铺写法也要判成「坏」（兜底重试，不许泄漏）',
+          cs.looks_broken('先确认一下。\n\n{"tool": "PowerShell", "command": "Get-Loc'))
 
     section('单元 · Windows 路径转义')
     # ★ 回归：模型写路径时几乎从不转义，而 JSON 里 \b \f \n \r \t \u 都是
@@ -1007,6 +1065,192 @@ def test_unit():
     f3 = cs.fingerprint('系统提示B', [{'name': 'X'}])
     check('系统提示相同则指纹相同（工具不影响）', f1 == f2, '这是异步加载 MCP 的关键')
     check('系统提示不同则指纹不同', f1 != f3)
+
+    # ── 缺陷 44：重试路径必须跳过开关对齐 ──
+    #
+    # ★ 为什么用 AST 静态检查而不是调一次：这条规则是「调用链有没有把参数传对」，
+    #   跑起来测要真起浏览器；而静态检查能**精确**钉住那一个调用点。
+    #   这跟当初防「重试漏传 attachments」用的是同一招（那个招确实拦下过问题）。
+    section('单元 · 缺陷 44（重试不碰开关）')
+    src = open(os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                            'claude_shim.py'), encoding='utf-8').read()
+    import ast as _ast
+    _tree = _ast.parse(src)
+    # 找所有 ask_web(...) 调用，看哪些显式传了 skip_toggles=True
+    _skip_true, _skip_absent = 0, 0
+    for _n in _ast.walk(_tree):
+        if not (isinstance(_n, _ast.Call) and isinstance(_n.func, _ast.Name)
+                and _n.func.id == 'ask_web'):
+            continue
+        _kw = [k for k in _n.keywords if k.arg == 'skip_toggles']
+        if not _kw:
+            _skip_absent += 1
+        elif isinstance(_kw[0].value, _ast.Constant) and _kw[0].value.value is True:
+            _skip_true += 1
+    check('★ 有调用点显式传了 skip_toggles=True（重试那处）', _skip_true >= 1,
+          '一个都没有 —— 缺陷 44 的修法被改回去了')
+    check('正常路径没传 skip_toggles（开关该对齐还得对齐）', _skip_absent >= 1,
+          '全都跳过了？那「每轮双向对齐」就废了')
+    check('shim 里能用 ds.TRUNCATED_WARN（不是硬编码中文）',
+          'ds.TRUNCATED_WARN' in src, '改文案时靠常量，别靠 match 中文')
+
+    # ── 缺陷 46：解析必须只有一个入口（重试路径曾经绕过改名） ──
+    #
+    # ★ 这条钉的是「结构」而不是「这一次的写法」：全仓只有 parse_and_align
+    #   里能出现 parse_reply。将来谁再加一个解析点、绕过改名，这里就红。
+    #   （和上面防「重试漏传 attachments」是同一路数：能静态钉住的就别靠记性。）
+    _pr_calls = [n for n in _ast.walk(_tree)
+                 if isinstance(n, _ast.Call) and isinstance(n.func, _ast.Name)
+                 and n.func.id == 'parse_reply']
+    check('★ parse_reply 全仓只有一个调用点（都在 parse_and_align 里）',
+          len(_pr_calls) == 1,
+          f'{len(_pr_calls)} 个调用点 —— 多出来的那个绕过了「改名」这一步')
+
+    # ── 缺陷 45：截断警告是个常量，且不能当真错误处理 ──
+    section('单元 · 缺陷 45（截断要说出来）')
+    check('TRUNCATED_WARN 常量存在', isinstance(ds_init.TRUNCATED_WARN, str)
+          and bool(ds_init.TRUNCATED_WARN), repr(getattr(ds_init, 'TRUNCATED_WARN', None)))
+    check('ask_web 里是「不等于警告才 raise」', 'err != ds.TRUNCATED_WARN' in src,
+          '直接 if err: raise 的话，警告会被当成失败 → 本来能用的回答变 500')
+
+    # ── 伪流式：能吐的前缀 ──
+    section('单元 · 伪流式（可吐前缀）')
+    sp = ds_init.streamable_prefix
+    check('纯文本回答 → 全文可吐', sp('这是一段普通回答，没有任何花括号') == '这是一段普通回答，没有任何花括号')
+    check('★ 工具调用 → 只吐 `{` 之前的叙述',
+          sp('我先看一下目录。\n{"tool_use": {"name": "Read"}}') == '我先看一下目录。\n',
+          'JSON 不能流，吐出去就是垃圾')
+    check('开头的 `{` → 一个字都不吐', sp('{"tool_use": {"name": "Read"}}') == '')
+    check('`[` 不算判据（Markdown 里太常见）',
+          sp('参考 [1] 和 [2]\n\n结论是……') == '参考 [1] 和 [2]\n\n结论是……',
+          '拿 `[` 当判据会频繁误截正常回答')
+    check('空串安全', sp('') == '')
+    # ★ 流式吐的必须和非流式喂给上游的是**同一份文本**：非流式走 clean()，
+    #   流式原先吐的是原文 —— 开深度思考时那行「已深度思考（用时 N 秒）」
+    #   会被流出去，而普通路径会把它删掉。同一份回答，两条路产出不一样。
+    check('★ 思考标题行到齐后要删掉（和非流式的 clean() 对齐）',
+          sp('已深度思考（用时 12 秒）\n\n正文在此') == '正文在此',
+          repr(sp('已深度思考（用时 12 秒）\n\n正文在此')))
+    # ★ 标题行没写完之前先压住。SSE 的 delta 只能加不能减 ——
+    #   把「已深度思考（用时 3」吐出去就收不回来了。
+    #   压住是安全的：真等不到换行，_finish_stream 会把结尾补上。
+    check('★ 标题行还没写完时先压住不吐',
+          sp('已深度思考（用时 3') == '', repr(sp('已深度思考（用时 3')))
+
+    # ── 伪流式：差量算法 ──
+    section('单元 · 伪流式（差量不重复）')
+    class _FakeW:
+        def __init__(self):
+            self.buf = b''
+        def write(self, b):
+            self.buf += b
+        def flush(self):
+            pass
+    class _FakeH:
+        def __init__(self):
+            self.w = _FakeW()
+        def _raw_write(self, b):
+            self.w.write(b)
+    _h = _FakeH()
+    _dw = cs.DeltaWriter(_h)
+    _dw.text('你好')
+    _dw.text('你好，世界')          # 增量：，世界
+    _dw.text('你好')                # 变短 → 必须忽略
+    _body = _h.w.buf.decode('utf-8', 'replace')
+    _import_re = __import__('re')
+    # ★ 只从 **content_block_delta** 事件里抠 text_delta 的 text。
+    #   别用宽泛的 `"text": "..."` —— `content_block_start` 里也有个
+    #   `'text': ''`，会被一起捞进来，于是「2 片」被数成「3 片」。
+    #   （我自己先踩了这个，是自测把它抓出来的。）
+    _deltas = []
+    for _ev in _body.split('event: content_block_delta'):
+        _m = _import_re.search(r'"type": "text_delta", "text": "((?:[^"\\]|\\.)*)"', _ev)
+        if _m:
+            _deltas.append(_m.group(1))
+    check('★ 只吐变长的部分（差量）', len(_deltas) == 2, f'{len(_deltas)} 片：{_deltas}')
+    check('★ 变短时不倒退、不重吐', _dw.shown == '你好，世界', repr(_dw.shown))
+    check('已吐内容拼起来 = 最后一次的前缀',
+          __import__('json').loads('"' + ''.join(_deltas) + '"') == '你好，世界',
+          repr(_deltas))
+
+    # ── 伪流式：SSE 收尾的事件序列 ──
+    section('单元 · 伪流式（SSE 事件序列）')
+    _msg = {'id': 'm1', 'type': 'message', 'role': 'assistant', 'model': 'x',
+            'content': [{'type': 'text', 'text': '收到'}],
+            'stop_reason': 'end_turn', 'stop_sequence': None,
+            'usage': {'input_tokens': 0, 'output_tokens': 0}}
+    _h2 = _FakeH()
+    _h2.send_response = lambda *a, **k: None
+    _h2.send_header = lambda *a, **k: None
+    _h2.end_headers = lambda: None
+    _h2.wfile = _h2.w
+    # ★ 把**真的** Handler 方法挂上去，而不是自己重写一遍 ——
+    #   重写的话测的就是「我的测试」而不是被测代码了。
+    _h2._finish_stream = cs.Handler._finish_stream.__get__(_h2)
+    _h2._raw_write_end = cs.Handler._raw_write_end.__get__(_h2)
+    # ★ 走**完整的**流式流程，而不是只调 _finish_stream ——
+    #   流式响应是两段发的：
+    #     第一段（handler 主流程、在问模型之前）：头 + message_start
+    #     第二段（_finish_stream、拿到回答之后）：正文块 + message_stop
+    #   只测第二段的话，事件序列里当然没有 message_start。
+    cs.stream_headers(_h2)
+    _h2._raw_write(cs._sse_event('message_start', {
+        'type': 'message_start', 'message': {
+            'id': 'm1', 'type': 'message', 'role': 'assistant', 'model': 'x',
+            'content': [], 'stop_reason': None, 'stop_sequence': None,
+            'usage': {'input_tokens': 0, 'output_tokens': 0}}}))
+    _h2._finish_stream(cs.DeltaWriter(_h2), _msg)
+    _seq = __import__('re').findall(r'^event: (\S+)', _h2.w.buf.decode('utf-8', 'replace'),
+                                    __import__('re').M)
+    check('★ 事件序列以 message_start 开头', _seq[:1] == ['message_start'], str(_seq))
+    check('★ 事件序列以 message_stop 收尾', _seq[-1:] == ['message_stop'], str(_seq))
+    check('★ message_start / stop 各只出现一次',
+          _seq.count('message_start') == 1 and _seq.count('message_stop') == 1, str(_seq))
+    check('★ 每个开的块都关了（start / stop 数一致）',
+          _seq.count('content_block_start') == _seq.count('content_block_stop'), str(_seq))
+
+    # ── 缺陷 47：流式下报错不能改发 JSON（会把响应写坏） ──
+    #
+    # ★ 头一旦发出去（200 + chunked），响应就**已经提交了** —— 此时再
+    #   `send_response(500)` 会把 HTTP 状态行写进**响应体**里，客户端的
+    #   chunked 解码器拿它当块长度解析 → int('HTTP/1.1 500 X', 16) → ValueError。
+    #   实测探针收到的字节里真的有第二个 `HTTP/1.1 500` 和 Content-Length。
+    #   ★ 这和 DeltaWriter 裸写那次是同一个病（往已提交的响应里混格式），
+    #     只是入口不同 —— 所以修法是**收成一个出口** `_fail()`，
+    #     而不是「记得两处都改」。下面这三条就是钉住这个出口。
+    section('单元 · 缺陷 47（流式报错不能写 JSON）')
+    check('报错收成一个出口（源码里不再有裸的 self._json(500）',
+          'self._json(500' not in src,
+          '流式下它会把 HTTP 状态行写进已提交的响应体，客户端直接炸')
+
+    _h3 = _FakeH()
+    _h3.send_response = lambda *a, **k: None
+    _h3.send_header = lambda *a, **k: None
+    _h3.end_headers = lambda: None
+    _h3.wfile = _h3.w
+    _h3._fail = cs.Handler._fail.__get__(_h3)
+    _h3._raw_write_end = cs.Handler._raw_write_end.__get__(_h3)
+    cs.stream_headers(_h3)                       # ← 头已经发出去了
+    _h3._fail(500, '回答没有开始', streaming=True, dw=None)
+    _fb = _h3.w.buf.decode('utf-8', 'replace')
+    check('★ 流式报错走 SSE error 事件（客户端会转成 APIError）',
+          'event: error' in _fb, _fb[:150])
+    check('★ 流式报错不再混进 HTTP 状态行', 'HTTP/1.1 500' not in _fb, _fb[:150])
+    check('★ 流式报错也要正确收尾（chunked 的 0 块，否则客户端一直等）',
+          _fb.endswith('0\r\n\r\n'), repr(_fb[-24:]))
+
+    # 非流式那半边不能被带坏 —— 还得是一个正经的 500 + JSON 正文
+    _h4 = _FakeH()
+    _h4.send_response = lambda code, *a: _h4.w.write(b'HTTP/1.1 %d X\r\n' % code)
+    _h4.send_header = lambda k, v: _h4.w.write(('%s: %s\r\n' % (k, v)).encode())
+    _h4.end_headers = lambda: _h4.w.write(b'\r\n')
+    _h4.wfile = _h4.w
+    _h4._json = cs.Handler._json.__get__(_h4)
+    _h4._fail = cs.Handler._fail.__get__(_h4)
+    _h4._fail(500, '回答没有开始')
+    _jb = _h4.w.buf.decode('utf-8', 'replace')
+    check('非流式报错照旧发 JSON（500 + api_error 正文）',
+          'HTTP/1.1 500' in _jb and 'api_error' in _jb, _jb[:150])
 
 
 # ══════════════════════════════════════════════════════════
