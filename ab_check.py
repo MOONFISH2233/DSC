@@ -110,7 +110,11 @@ def run_side(label, url, headers, model, task, workdir, max_rounds=25):
     msgs = [{'role': 'user', 'content': task % outfile.replace('\\', '\\\\')}]
     rec = {'label': label, 'rounds': 0, 'tools': [], 'elapsed': 0.0,
            'leaked': 0, 'narrated': 0, 'usage_in': 0, 'usage_out': 0,
-           'errors': [], 'texts': [], 'final': '', 'outfile': outfile}
+           'errors': [], 'texts': [], 'final': '', 'outfile': outfile,
+           # ★ 工具**结果**报错的次数 —— 「模型跑的命令失败了几次」。
+           #   这是除轮数之外最能说明「谁更靠谱」的量：原生 API 那边几乎
+           #   不该有，dsc 这边每失败一次就多烧一轮。
+           'tool_errors': 0}
     t0 = time.time()
     for rnd in range(1, max_rounds + 1):
         rec['rounds'] = rnd
@@ -153,7 +157,11 @@ def run_side(label, url, headers, model, task, workdir, max_rounds=25):
         results = []
         for tu in uses:
             out, err = run_tool(tu.get('name'), tu.get('input') or {})
-            print('        %-11s → %s' % (tu.get('name'), out[:80].replace('\n', ' ')))
+            if err:
+                rec['tool_errors'] += 1
+            print('        %-11s → %s%s'
+                  % (tu.get('name'), out[:80].replace('\n', ' '),
+                     '   ❌ 这步失败了' if err else ''))
             results.append({'type': 'tool_result', 'tool_use_id': tu.get('id'),
                             'content': [{'type': 'text', 'text': out}],
                             **({'is_error': True} if err else {})})
@@ -226,12 +234,80 @@ def show(a, b):
     print('  逐轮叙述留在 %s' % TMP_DIR)
 
 
+def _med(xs):
+    xs = sorted(xs)
+    return xs[len(xs) // 2] if xs else 0
+
+
+def summarize(pairs):
+    """
+    多次对拍汇总。
+
+    ★ 单次对拍**只能找 bug**（结构性错误一次就够定罪），
+      要谈「谁更利索」必须有分布 —— 模型每次跑都不一样，
+      一次 7:3、下一次可能 6:5，拿单次说倍数是没有统计意义的。
+      这里给中位数和范围，让人自己看**分不分得开**。
+    """
+    def prep(recs):
+        out = []
+        for r in recs:
+            r = dict(r)
+            r['tools_n'] = sum(len(x) for x in r['tools'])
+            r['patch'] = (r.get('retries', 0) + r.get('no_content', 0)
+                          + r.get('continues', 0) + r.get('busy', 0))
+            out.append(r)
+        return out
+
+    A = prep([a for a, _ in pairs])
+    B = prep([b for _, b in pairs])
+    n = len(pairs)
+    rows = [
+        ('轮数 中位', [_med([r['rounds'] for r in A]), _med([r['rounds'] for r in B])]),
+        ('轮数 范围', ['%d~%d' % (min(r['rounds'] for r in A),
+                                  max(r['rounds'] for r in A)),
+                       '%d~%d' % (min(r['rounds'] for r in B),
+                                  max(r['rounds'] for r in B))]),
+        ('工具调用 中位', [_med([r['tools_n'] for r in A]),
+                           _med([r['tools_n'] for r in B])]),
+        ('墙钟 中位（秒）', ['%.0f' % _med([r['elapsed'] for r in A]),
+                             '%.0f' % _med([r['elapsed'] for r in B])]),
+        ('★ 工具结果报错 合计', [sum(r['tool_errors'] for r in A),
+                                 sum(r['tool_errors'] for r in B)]),
+        ('★ 补丁 合计（重试/缺content/续写/繁忙）',
+         [sum(r['patch'] for r in A), sum(r['patch'] for r in B)]),
+        ('工具调用原文泄漏 合计', [sum(r['leaked'] for r in A),
+                                   sum(r['leaked'] for r in B)]),
+        ('产物字节 中位', [_med([r['artifact'] for r in A]),
+                           _med([r['artifact'] for r in B])]),
+    ]
+    print()
+    print('=' * 78)
+    print('  汇总（%d 轮对拍）' % n)
+    print('=' * 78)
+    print('  %-34s %-16s %-16s' % ('', 'A · dsc', 'B · 真实 API'))
+    for name, (x, y) in rows:
+        print('  %-34s %-16s %-16s' % (name, x, y))
+    print()
+    print('  token：A in %d / out %d      B in %d / out %d   ← B 这些要花钱'
+          % (sum(r['usage_in'] for r in A), sum(r['usage_out'] for r in A),
+             sum(r['usage_in'] for r in B), sum(r['usage_out'] for r in B)))
+    print()
+    print('  ★ 怎么读这张表：先看**分不分得开** —— 两个范围要是重叠，')
+    print('    那点差异就是噪声，别当结论。看得开、又稳定的那几行才是真差距。')
+    print('  逐轮叙述留在 %s\\runN\\' % TMP_DIR)
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('--side', choices=['both', 'shim', 'api'], default='both')
     ap.add_argument('--task', choices=['full', 'short'], default='short',
                     help='short 省 token（默认）；full 是 e2e 那道长任务')
     ap.add_argument('--rounds', type=int, default=25)
+    ap.add_argument('--repeat', type=int, default=1,
+                    help='跑几轮对拍（≥3 才谈得上「系统性差距」）')
+    ap.add_argument('--save', action='store_true',
+                    help='保留产物（默认每轮开跑前清空，免得上一轮的成品'
+                         '改变这一轮的起点 —— e2e 踩过这个坑）')
     args = ap.parse_args()
 
     task = SHORT_TASK if args.task == 'short' else task_text('%s')
@@ -240,54 +316,79 @@ def main():
         task = task.replace(os.path.join(HERE, '_e2e_tmp', 'gen_report.py'), '%s')
 
     print('=' * 78)
-    print('  A/B 对拍 · 任务=%s' % args.task)
+    print('  A/B 对拍 · 任务=%s · %d 轮' % (args.task, args.repeat))
     print('=' * 78)
 
-    a = b = None
+    shim_used_8799 = shim_up('http://127.0.0.1:8799')
+    if shim_used_8799 and args.side in ('both', 'shim'):
+        print('\n⚠️  8799 上有一个 shim 在跑（可能是你的 dsc 会话）。')
+        print('    对拍会用自己那个（%d），但**浏览器只有一个** ——' % SHIM_PORT)
+        print('    你那边一有请求，两边就会互相把页面导航走。')
+        print('    建议先确认没有别的 dsc 会话在跑。\n')
+
+    ep = None
+    if args.side in ('both', 'api'):
+        ep = api_endpoint()
+        if not ep:
+            print('❌ 环境里没有 ANTHROPIC_BASE_URL / ANTHROPIC_AUTH_TOKEN，'
+                  '跑不了 B 侧')
+            return 2
+        print('  B 侧: %s  model=%s' % (ep['base'], ep['model']))
+
+    pairs = []
     proc = None
     try:
-        if args.side in ('both', 'shim'):
-            if shim_up('http://127.0.0.1:8799'):
-                print('\n⚠️  8799 上有一个 shim 在跑（可能是你的 dsc 会话）。')
-                print('    对拍会用自己那个（%d），但**浏览器只有一个** ——' % SHIM_PORT)
-                print('    你那边一有请求，两边就会互相把页面导航走。')
-                print('    建议先确认没有别的 dsc 会话在跑。\n')
-            print('[A] dsc（网页版 + 协议模拟）—— 自己起一个 shim（端口 %d）'
-                  % SHIM_PORT)
-            # ★ 传自己的目录：start_shim 默认往 e2e_check 的 _e2e_tmp 写，
-            #   而那边不归我们管、也不保证存在（第一版就是这么炸的）。
-            proc, url, ownlog = start_shim(SHIM_PORT, os.path.join(TMP_DIR, 'shim'))
-            a = run_side('dsc', url, {'content-type': 'application/json'},
-                         'deepseek-web', task,
-                         os.path.join(TMP_DIR, 'shim'), args.rounds)
-            # ★ 重试/续写只有 dsc 这侧才有（原生 API 不需要这些补救机制）——
-            #   从**自己那个 shim 的 stderr** 里数，不读公共日志（那是所有
-            #   shim 共写的，会把用户 dsc 会话的行算到我们头上）。
-            _log = read_own_log(ownlog)
-            a['retries'] = len(re.findall(r'\[重试\].*重新问一次', _log))
-            a['no_content'] = len(re.findall(r'缺 content', _log))
-            a['continues'] = len(re.findall(r'\[续写\].*点「继续生成」', _log))
-            a['busy'] = len(re.findall(r'\[繁忙\]', _log))
-        if args.side in ('both', 'api'):
-            ep = api_endpoint()
-            if not ep:
-                print('❌ 环境里没有 ANTHROPIC_BASE_URL / ANTHROPIC_AUTH_TOKEN，'
-                      '跑不了 B 侧')
-                return 2
-            print('\n[B] 真实 API（原生工具调用）—— %s  model=%s'
-                  % (ep['base'], ep['model']))
-            # ★ 只传 base —— run_side 自己会接 '/v1/messages'。
-            #   第一版在这儿又接了一次，拼成 .../v1/messages/v1/messages，
-            #   于是 404 cave_route_not_found（还先去查了一轮请求头，白查）。
-            b = run_side('api', ep['base'], ep['headers'],
-                         ep['model'], task, os.path.join(TMP_DIR, 'api'),
-                         args.rounds)
+        for i in range(1, args.repeat + 1):
+            print('\n' + '━' * 78)
+            print('  第 %d/%d 轮对拍' % (i, args.repeat))
+            print('━' * 78)
+            run_dir = os.path.join(TMP_DIR, 'run%d' % i)
+            if not args.save and i > 1:
+                shutil.rmtree(run_dir, ignore_errors=True)
+            a = b = None
+
+            if args.side in ('both', 'shim'):
+                # ★ 每轮都要重起 shim 吗？不用 —— 但**必须让它用干净的
+                #   目录**，而且不能复用上一轮的会话映射（那会让第二轮
+                #   变成「接着上一轮聊」，任务就不是同一个起点了）。
+                #   所以每轮换个新的 session_id，映射自然就分开了。
+                print('[A] dsc（网页版 + 协议模拟）')
+                if proc is None:
+                    # ★ 传自己的目录：start_shim 默认往 e2e_check 的 _e2e_tmp
+                    #   写，而那边不归我们管、也不保证存在（第一版就是这么炸的）。
+                    proc, url, ownlog = start_shim(
+                        SHIM_PORT, os.path.join(run_dir, 'shim'))
+                # ★ shim 只起一次、连着跑多轮，所以它的 stderr 是**累积**的 ——
+                #   必须只数这一轮新增的那一段，否则第 2 轮会把第 1 轮的重试
+                #   再数一遍（数出来的是 1、2、3… 的累加，看着像越来越糟）。
+                #   e2e 那边也踩过同类坑（读公共日志会把用户的会话算进来）。
+                _before = read_own_log(ownlog)
+                a = run_side('dsc', url, {'content-type': 'application/json'},
+                             'deepseek-web', task,
+                             os.path.join(run_dir, 'shim'), args.rounds)
+                _log = read_own_log(ownlog)[len(_before):]
+                a['retries'] = len(re.findall(r'\[重试\].*重新问一次', _log))
+                a['no_content'] = len(re.findall(r'缺 content', _log))
+                a['continues'] = len(re.findall(r'\[续写\].*点「继续生成」', _log))
+                a['busy'] = len(re.findall(r'\[繁忙\]', _log))
+
+            if args.side in ('both', 'api'):
+                print('\n[B] 真实 API（原生工具调用）')
+                # ★ 只传 base —— run_side 自己会接 '/v1/messages'。
+                #   第一版在这儿又接了一次，拼成 .../v1/messages/v1/messages，
+                #   于是 404 cave_route_not_found（还先去查了一轮请求头，白查）。
+                b = run_side('api', ep['base'], ep['headers'], ep['model'],
+                             task, os.path.join(run_dir, 'api'), args.rounds)
+
+            if a and b:
+                pairs.append((a, b))
+                show(a, b)
     finally:
         if proc:
             proc.kill()
 
-    if a and b:
-        show(a, b)
+    if len(pairs) > 1:
+        summarize(pairs)
     return 0
 
 

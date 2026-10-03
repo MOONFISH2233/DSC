@@ -766,6 +766,105 @@ def test_unit():
     # 不传 raw 时退回「被截断」那套（selftest 和 _clean_impact 的旧调用点靠这个）
     check('不传 raw 时行为不变（向后兼容）',
           '分几段' in (cs.retry_reason(no_content, WT) or ''))
+
+    # ★★ 第十八轮补二：**形状分不清谁配谁**是第三种原因，代价最大。
+    #   模型写 N 个调用却给不是 N 块代码 → 我们一块都不挂 → 重试。
+    #   而重试提示原先只有「被截断 / 你漏写了」两种，**都不对症**，
+    #   于是模型一遍遍重复同一形状：实测连着重试 3~4 次
+    #   （4204/3903/3924/3936 字，几乎一样），最后**一个文件都没写出来**。
+    #   提示必须直接说「我数到几块、应该几块」。
+    _mm = ('{"tool_use": ['
+           '{"name": "Write", "input": {"file_path": "a.py"}}, '
+           '{"name": "Write", "input": {"file_path": "b.txt"}}]}\n'
+           '```\na 的内容\n```\n```\nb 的内容\n```\n```\n多出来的一块\n```\n')
+    _pmm = cs.parse_reply(_mm)
+    check('形状对不上时解析成 tools（内容空着）',
+          _pmm[0] == 'tools' and not (_pmm[1][0]['input'].get('content')
+                                      or _pmm[1][1]['input'].get('content')))
+    _hmm = cs.retry_reason(_pmm, [{'name': 'Write'}, {'name': 'PowerShell'}],
+                           _mm) or ''
+    check('★ 形状对不上时，提示要说清「分不清哪块配哪个」',
+          '分不清' in _hmm, repr(_hmm[:100]))
+    # ★ 断言要**具体到词**。第一版写的是 `'3' in _hmm and '2' in _hmm` ——
+    #   那条在**旧提示**上也是绿的（旧文案里有「12000」和「3)」），
+    #   等于什么都没测。判据要能区分「我想要的那句话」和「碰巧含这个字符」。
+    check('★ 而且要给出「数到几块 / 应该几块」',
+          '3 段' in _hmm and '2 个东西' in _hmm, repr(_hmm[:140]))
+    check('★ 还要给出可操作的做法（一一对应 / 一次只写一个）',
+          '一一对应' in _hmm and '一次只写一个' in _hmm, repr(_hmm[:200]))
+    # 数量正好对上时不该误报（那是正常形状）
+    _ok2 = ('{"tool_use": ['
+            '{"name": "Write", "input": {"file_path": "a.py"}}, '
+            '{"name": "Write", "input": {"file_path": "b.txt"}}]}\n'
+            '```\na 的内容\n```\n```\nb 的内容\n```\n')
+    check('数量正好对上时不报「分不清」',
+          '分不清' not in (cs.retry_reason(cs.parse_reply(_ok2),
+                                           [{'name': 'Write'}], _ok2) or ''))
+
+    # ★★ 第十八轮补二（实测形状）：模型给**已经内联了参数**的调用也配了代码块。
+    #
+    #   日志里的原样（加了「各块的样子」之后才看清的）：
+    #       #1[python]1991字 脚本 / #2[text]231字 测试文本 / #3[powershell]116字 运行命令
+    #   而 PowerShell 的 command **早就写在 JSON 里了** —— 于是「缺的」只有 2 个、
+    #   代码块却有 3 块。只按「缺的」对齐会判成「分不清谁配谁」→ 白重试一轮，
+    #   而那个形状其实**完全能对上**（3 个槽位配 3 块，一一对应）。
+    _slot3 = ('{"tool_use": ['
+              '{"name": "Write", "input": {"file_path": "a.py"}}, '
+              '{"name": "Write", "input": {"file_path": "b.txt"}}, '
+              '{"name": "PowerShell", "input": {"description": "跑", "command": "py a.py"}}'
+              ']}\n'
+              '```python\n脚本内容\n```\n'
+              '```text\n测试文本\n```\n'
+              '```powershell\npy a.py\n```\n')
+    _r3s = cs.parse_reply(_slot3)
+    check('★ 3 槽位 3 块能对上（多出来的那块属于已内联参数的调用）',
+          _r3s[0] == 'tools'
+          and (_r3s[1][0]['input'].get('content') or '').strip() == '脚本内容'
+          and (_r3s[1][1]['input'].get('content') or '').strip() == '测试文本',
+          str([(t['name'], (t.get('input') or {}).get('content'))
+               for t in _r3s[1]])[:180] if _r3s[0] == 'tools' else str(_r3s)[:120])
+    check('★ 已内联参数的调用不被覆盖（command 保持原样）',
+          _r3s[0] == 'tools'
+          and _r3s[1][2]['input'].get('command') == 'py a.py',
+          str(_r3s)[:160])
+    check('★ 这个形状不该被判成「分不清」（否则白重试一轮）',
+          '分不清' not in (cs.retry_reason(
+              _r3s, [{'name': 'Write'}, {'name': 'PowerShell'}], _slot3) or ''))
+
+    # ★★ 从**真实日志**抄下来的形状（第十八轮补二，4 轮对拍里出现 5 次）：
+    #     调用：Write(a.py), Write(b.txt)              ← 两个都要文件内容
+    #     代码块：#1[python] 脚本 / #2[text] 测试文本 / #3[powershell] 运行命令
+    #   第 3 块是**模型打算下一步跑的命令**，它这一轮压根没为它发工具调用。
+    #   只数数量（2 个要补 vs 3 块）会判成「分不清谁配谁」→ 白烧一次重试。
+    #   语言标记一看就清楚：那两个 Write 要的是**内容**块，`powershell` 不是。
+    _real = ('先写脚本和测试文本，然后跑一遍验证。\n\n'
+             '{"tool_use": ['
+             '{"name": "Write", "input": {"file_path": "D:' + B + 't' + B + 'a.py"}}, '
+             '{"name": "Write", "input": {"file_path": "D:' + B + 't' + B + 'b.txt"}}'
+             ']}\n'
+             '```python\nimport sys\n```\n'
+             '```text\nthe quick brown fox\n```\n'
+             '```powershell\npy gen.py b.txt\n```\n')
+    _rr = cs.parse_reply(_real)
+    check('★ 实测形状：3 块代码里那块 powershell 不抢 Write 的内容',
+          _rr[0] == 'tools'
+          and 'import sys' in (_rr[1][0]['input'].get('content') or '')
+          and 'quick brown fox' in (_rr[1][1]['input'].get('content') or ''),
+          str([(t['name'], (t.get('input') or {}).get('content'))
+               for t in _rr[1]])[:180] if _rr[0] == 'tools' else str(_rr)[:120])
+    check('★ 实测形状不该判成「分不清」（这就是那 5 次白重试）',
+          not cs.block_pairing_failed(
+              cs._remove_tool_call_span(_real),
+              _rr[1] if _rr[0] == 'tools' else [])[0])
+    # 但**没有任何可信语言标记**时不能靠顺序猜 —— 命令块可能在最前面
+    _notag = ('{"tool_use": ['
+              '{"name": "Write", "input": {"file_path": "a.py"}}, '
+              '{"name": "Write", "input": {"file_path": "b.txt"}}]}\n'
+              '```\n第一条\n```\n```\n第二条\n```\n```\n第三条\n```\n')
+    _pn = cs.parse_reply(_notag)
+    check('★ 全无语言标记时，3 块配 2 个调用仍然拒绝（不靠顺序猜）',
+          cs.block_pairing_failed(cs._remove_tool_call_span(_notag),
+                                  _pn[1] if _pn[0] == 'tools' else [])[0])
     check('Write 有 content 就不算缺',
           cs.incomplete_tool([{'name': 'Write',
                                'input': {'file_path': 'D:' + chr(92) + 'a.py',

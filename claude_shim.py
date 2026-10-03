@@ -752,6 +752,103 @@ _BLOCK_FIELD = {
 _CODE_BLOCK_RE_NG = re.compile(r'```[a-zA-Z0-9_+\-]*\r?\n(.*?)\r?\n?\s*```', re.S)
 
 
+def needy_calls(tools):
+    """
+    哪些调用**缺**那个必须由代码块补的长字段，返回 [(下标, 字段名), ...]。
+
+    ★ 抽出来是因为两处要用同一套判据：补内容（_attach_code_block）和
+      「形状分不清」时给重试提示（retry_reason）。各写一遍迟早不一致 ——
+      这个项目栽过六次了。
+    ★ 不认识的工具（_BLOCK_FIELD 里没有）**不算** needy：它本来就不该被填。
+    """
+    out = []
+    for i, t in enumerate(tools or []):
+        field = _BLOCK_FIELD.get(t.get('name'))
+        if field and not (t.get('input') or {}).get(field):
+            out.append((i, field))
+    return out
+
+
+# 代码块的**语言标记**能告诉我们它是「文件内容」还是「要跑的命令」——
+# 多块配对时这是最可靠的信号（见 _attach_code_block 里那段说明）。
+#
+# ★ 只列**认得出来的**：没列的一律算「认不出」，两边都能配（保守）。
+#   宁可让认不出的块保持弹性，也不要凭猜把它归到某一类。
+_CMD_BLOCK_TAGS = {'powershell', 'ps1', 'ps', 'bash', 'sh', 'shell', 'zsh',
+                   'cmd', 'bat', 'console', 'terminal', 'pwsh'}
+_CONTENT_BLOCK_TAGS = {'python', 'py', 'python3', 'text', 'txt', 'plaintext',
+                       'markdown', 'md', 'json', 'yaml', 'yml', 'toml', 'ini',
+                       'javascript', 'js', 'typescript', 'ts', 'html', 'css',
+                       'sql', 'csv', 'xml', 'java', 'c', 'cpp', 'h', 'go',
+                       'rust', 'rb', 'php', 'vue', 'dockerfile'}
+
+
+def _block_kind(match):
+    """这一块是 'command' / 'content' / None（认不出）。"""
+    tag = match.group(0).split('\n', 1)[0].lstrip('`').strip().lower()
+    if tag in _CMD_BLOCK_TAGS:
+        return 'command'
+    if tag in _CONTENT_BLOCK_TAGS:
+        return 'content'
+    return None
+
+
+def pair_blocks_by_kind(region, need):
+    """
+    按「这块是命令还是内容」把代码块配给缺字段的调用，返回 {调用下标: 内容}。
+
+    配不上返回 None（调用方自己去拒绝/报错）。
+
+    ★ 为什么需要这个：实测形状（第十八轮补二，日志「各块的样子」）——
+        调用：Write(a.py), Write(b.txt)        ← 两个都要文件内容
+        代码块：#1[python] 脚本 / #2[text] 测试文本 / #3[powershell] 运行命令
+      第 3 块是**模型打算下一步跑的命令**，它这一轮压根没为它发工具调用。
+      只数数量（2 个要补 vs 3 块）会判成「分不清谁配谁」→ 白重试一轮；
+      而按语言标记一看就清楚：那两个 Write 要的是**内容**块，
+      `powershell` 那块不是给它们的。
+    实测这个形状在 4 轮对拍里出现了 5 次，每次都白烧一次重试。
+    """
+    cand = [(m, _block_kind(m)) for m in _CODE_BLOCK_RE_NG.finditer(region)]
+    # ★ 一个可信标记都没有 → **不在这儿配**，交给「按个数配」那条路。
+    #   全是「认不出」的时候，按顺序取前 N 块就是纯粹的猜：模型完全可能
+    #   把命令块写在最前面（[命令, 脚本, 文本]），取前 2 块就把命令写进了
+    #   .py 文件。**只有语言标记真的能区分时才用它**。
+    if not any(k for _m, k in cand):
+        return None
+    used, assign = set(), {}
+    for (i, field) in need:
+        want = 'command' if field == 'command' else 'content'
+        for j, (m, kind) in enumerate(cand):
+            if j in used:
+                continue
+            if kind is None or kind == want:
+                used.add(j)
+                assign[i] = m.group(1)
+                break
+        else:
+            return None                      # 有一个配不上 → 整体不动手
+    return assign
+
+
+def block_pairing_failed(region, tools):
+    """
+    补内容那一步会不会**放弃**（一块都不挂）？会的话返回 True。
+
+    ★ 抽出来给两处共用：补内容（_attach_code_block）和「形状分不清」时给
+      重试提示（retry_reason）。这个项目栽过六次「同一个职责两份实现」，
+      而这两处**判反了更糟** —— 一边按「能配上」去配、另一边按「配不上」
+      去报错，用户看到的提示就和实际行为矛盾。
+    返回 (是否放弃, 块数, 缺字段的调用数)。
+    """
+    need = needy_calls(tools)
+    n_blk = len(_CODE_BLOCK_RE_NG.findall(region))
+    if len(need) <= 1:
+        return False, n_blk, len(need)       # 单个走贪婪老路径，不会放弃
+    if pair_blocks_by_kind(region, need):
+        return False, n_blk, len(need)       # ① 按形态配得上
+    return n_blk != len(need), n_blk, len(need)   # ② 只剩「按个数配」
+
+
 def _attach_code_block(text, tools):
     """
     把 JSON 后面的代码块内容，补给工具调用里缺的那个长字段。
@@ -795,28 +892,54 @@ def _attach_code_block(text, tools):
     #   被上游拒（参数非法，红的），比不填还糟：Read 没有 content、
     #   WebFetch 没有 command、Task 的长字段叫 prompt 不叫 content。
     #   要支持新工具就往 _BLOCK_FIELD 里加一条，别让它猜。
-    need = [(i, _BLOCK_FIELD[t.get('name')])
-            for i, t in enumerate(tools)
-            if _BLOCK_FIELD.get(t.get('name'))
-            and not (t.get('input') or {}).get(_BLOCK_FIELD[t.get('name')])]
+    need = needy_calls(tools)
     if not need:
         return tools
 
     if len(need) == 1:
+        # 一个要补的 → 老路径（贪婪抓一块），行为一个字节都不变
         m = _CODE_BLOCK_RE.search(region)
         if not m:
             return tools
-        bodies = [m.group(1)]
+        fill = {need[0][0]: m.group(1)}
     else:
-        bodies = [m.group(1) for m in _CODE_BLOCK_RE_NG.finditer(region)]
-        if len(bodies) != len(need):
-            ds.log('[提示] %d 个调用缺长字段，但切出 %d 块代码 —— 分不清谁配谁，'
-                   '一块都不挂（交给重试报错，总比写错文件强）'
-                   % (len(need), len(bodies)))
-            return tools
-        ds.log('[提示] %d 个调用各配一块代码块（按出现顺序）' % len(bodies))
+        blocks = list(_CODE_BLOCK_RE_NG.finditer(region))
+        bodies = [m.group(1) for m in blocks]
 
-    fill = {i: body for (i, _f), body in zip(need, bodies)}
+        # 两条配对路子，谁先成谁算 —— 都成不了就**一块都不挂**。
+        #
+        # ① 按形态配（首选）：看代码块的语言标记是「命令」还是「文件内容」。
+        #    实测形状：调用是 [Write(a.py), Write(b.txt)]，块是
+        #    [#1 python 脚本, #2 text 测试文本, #3 powershell 运行命令] ——
+        #    第 3 块是**模型打算下一步跑的命令**，这一轮压根没为它发工具调用。
+        #    只数数量会判成「分不清谁配谁」→ 白重试一轮（实测 4 轮里出现 5 次），
+        #    而按语言标记一看就清楚：两个 Write 要的是**内容**块。
+        _by_kind = pair_blocks_by_kind(region, need)
+        if _by_kind:
+            fill = _by_kind
+            ds.log('[提示] %d 个调用按「命令/内容」配对成功（共 %d 块代码）'
+                   % (len(fill), len(bodies)))
+        # ② 按个数配：块数和「缺字段的调用数」正好相等 → 按出现顺序一一对应。
+        elif len(bodies) == len(need):
+            fill = {i: b for (i, _f), b in zip(need, bodies)}
+            ds.log('[提示] %d 个调用各配一块代码块（按出现顺序）' % len(fill))
+        else:
+            # ★ 都成不了 —— **不猜**，一块都不挂，交给重试报错。
+            #   分不清谁配谁还硬挂，就是把内容写进错的文件，而且不报错。
+            #   把**每一块的样子**记下来，别只说「5 块代码」：实测这个分支会
+            #   连着触发好几次（模型反复写同一种形状），日志只有一个数字的话，
+            #   下一次还是只能靠猜它长什么样。语言标记 + 长度 + 头 30 字，
+            #   一眼就能认出「它到底在写什么」。
+            ds.log('[提示] %d 个调用缺长字段，切出 %d 块代码 —— 分不清谁配谁，'
+                   '一块都不挂（交给重试报错，总比写错文件强）。各块的样子：%s'
+                   % (len(need), len(bodies),
+                      ' | '.join('#%d[%s]%d字:%r'
+                                 % (i + 1,
+                                    (blocks[i].group(0).split('\n')[0]
+                                     .lstrip('`') or '(无)')[:12],
+                                    len(b), b.strip()[:30])
+                                 for i, b in enumerate(bodies))))
+            return tools
     out = []
     for i, t in enumerate(tools):
         t = dict(t)
@@ -1300,6 +1423,41 @@ def retry_reason(parsed, tools, raw=None):
     #   给这种回复发「你被截断了、要分段」是**错误的诊断**，模型会以为自己已经
     #   写了一半、去纠结怎么分段。实测同一形状**连着重试 3 轮**，
     #   三次回复是 147/151/147 字，几乎一模一样 —— 提示词没起作用。
+    # ★★ 「形状分不清谁配谁」要单独说 —— 这是第十八轮补二实测出来的
+    #   第三种原因，而且**代价最大**：模型写了 N 个调用、却给了不是 N 块代码，
+    #   我们分不清哪块配哪个 → 一块都不挂 → 重试。而重试提示原先只有
+    #   「你被截断了/你漏写了」两种，**都不对症**，于是模型一遍遍重复
+    #   同一个形状：实测连着重试 3~4 次（4204/3903/3924/3936 字，形状几乎
+    #   一样），最后**一个文件都没写出来**（产物 0 字节）。
+    #
+    #   提示必须直接说「我数到几块、应该几块、你该怎么写」——
+    #   让它知道错在哪，而不是让它猜。
+    if raw is not None and parsed[0] == 'tools':
+        # ★ 判据和 _attach_code_block 共用一份（block_count_mismatch）——
+        #   两边判反了的话，提示说的和实际做的不一样。
+        _bad, _nblk, _nneed = block_pairing_failed(
+            _remove_tool_call_span(raw), parsed[1])
+        if _nneed >= 2 and _bad:
+            return ('你这一轮要写 %d 个东西（%s），但代码块有 %d 段 —— '
+                    '**我分不清哪一段是给哪个文件的**，所以一个都没敢用，'
+                    '这一轮什么都没写成。\n\n'
+                    '**请这样写**：每个需要长内容的调用，**紧跟一个代码块**，'
+                    '顺序和上面 JSON 里的调用顺序**一一对应**，'
+                    '中间不要插别的代码块、也不要把 JSON 本身包进 ``` 里：\n'
+                    '{"tool_use": [{"name": "Write", "input": {"file_path": "a.py"}},'
+                    ' {"name": "Write", "input": {"file_path": "b.txt"}}]}\n'
+                    '```\n（a.py 的内容）\n```\n'
+                    '```\n（b.txt 的内容）\n```\n\n'
+                    '★ 拿不准就**一次只写一个文件** —— 分两轮写完全没问题，'
+                    '总比一轮里写串了强。'
+                    % (_nneed,
+                       '、'.join(_BLOCK_FIELD[t.get('name')]
+                                 for t in parsed[1]
+                                 if _BLOCK_FIELD.get(t.get('name'))
+                                 and not (t.get('input') or {})
+                                 .get(_BLOCK_FIELD[t.get('name')])),
+                       _nblk))
+
     if raw is not None and len(raw) < OMITTED_BODY_CHARS and '```' not in raw:
         return ('你上一条回复**只给了 %s，正文一个字都没写** —— 不是被截断，'
                 '就是漏了。这种调用发出去必然失败。\n\n'
