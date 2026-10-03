@@ -231,11 +231,31 @@ CONTINUE_CLICK_TRIES = 2      # 每次续写最多点几遍
 
 # 结果清洗：只删行首的思考标题行。绝不做「整块删除」—— 思考块边界不可靠，
 # 删多了会连正文一起吃掉。主路径靠抓 .ds-markdown（思考块是它的兄弟节点）天然排除。
-THINK_HEADER_RE = re.compile(
-    r'^\s*(已深度思考|深度思考|思考中|正在思考|已思考|Thought about|Thinking)'
-    r'[^\n]{0,40}\n+',
-    re.M,
-)
+#
+# ★ 判据是「像不像元数据」，不是「这行够不够短」（第十八轮改的）。
+#   旧判据 `关键词 + [^\n]{0,40} + 换行` 的意思是「只要这行不超过 40 字就整行删掉」，
+#   于是把**用户的正文首行**当成标题吃了：
+#       思考中台是一种架构\n第二行内容   →  第二行内容
+#       Thinking about it, the answer is 42.  →  被吃
+#   不报错、日志干净、自测全绿 —— 静默数据损坏，正是这个项目最怕的一类。
+#
+#   真的标题行**整行都是元数据**（`已深度思考（用时 12 秒）`、`思考中...`），
+#   所以关键词后面只允许出现「不像词的东西」：除换行外的非 \w 字符
+#   （空白 / 中英文标点）、数字、以及下面那几个时长词。
+#
+#   \w 在 str 模式下是 Unicode 的 —— **CJK 汉字和字母都算 \w**，
+#   所以 `思考中台…` 在「台」、`Thinking about it, the answer is 42.` 在「the」
+#   就停住了，够不到行尾 → 不是标题 → 正文保住。
+#   （数字也是 \w，所以要单独把 \d 列进去。）
+#
+# ★ 宽严方向是刻意选的：漏删一个标题只是首行多一句「已深度思考（用时 N 秒）」，
+#   难看而已；误删正文是**静默数据损坏**。宁可漏删。
+_THINK_HEAD = r'(?:已深度思考|深度思考|思考中|正在思考|已思考|Thought about|Thinking)'
+_THINK_UNITS = (r'用时|秒|分钟|分|小时|时'
+                r'|for|about|it|a|few|secs?|seconds?|mins?|minutes?|hours?')
+_THINK_TAIL = rf'(?:[^\w\n]|\d|{_THINK_UNITS})*'
+
+THINK_HEADER_RE = re.compile(rf'^[ \t]*{_THINK_HEAD}{_THINK_TAIL}\n+', re.M)
 
 
 # ============================================================
@@ -782,7 +802,36 @@ def click_continue(page, tries=CONTINUE_CLICK_TRIES):
 
 
 def answer_done_rendered(page):
-    """最后一条 AI 回答下方的操作栏渲染出来了没有 —— 渲染了说明这条写完了。"""
+    """
+    最后一条 AI 回答下方的操作栏渲染出来了没有。
+
+    ⚠️⚠️ **别「修」这个函数 —— 它现在恒为 False，而这是安全的。** ⚠️⚠️
+
+    第十八轮实测（`_action_bar_probe.py` / `_done_signal_probe.py`）：
+
+    · 操作栏的真实位置在**祖父节点**，不是父节点 ——
+        ↑0  .ds-markdown.ds-assistant-message-main-content   操作栏 0 个
+        ↑1  .ds-message                                    操作栏 0 个  ← 本函数查的就是这层
+        ↑2  ._4f9bf79 …（每条消息自己的容器）                操作栏 6 个  ← 真在这
+        ↑3  .ds-virtual-list-visible-items                  操作栏 14 个（含**所有**可见消息）
+      所以 `parent()` 永远查不到 → 本函数永远返回 False。
+
+    · **但「修好」它会造成静默截断。** 实测：新回答**一边流式增长一边就已经
+      带着操作栏**（t=0.0 时 161 字、按钮已在；t=1.0 长到 368 字才停）。
+      也就是说操作栏根本不是「生成结束」的信号 —— 拿它当判据会在
+      **第一个轮询**就宣布写完，交出去半截回答。而半截回答是这个项目
+      最怕的一类失败（缺陷 20 / 42 / 45 全是它）。
+
+    · 它恒为 False 的代价只是**慢**：`wait_answer` 里那条
+        `cache['done_seen'] or stable_for >= stable_need * 2`
+      于是永远走右边的保守分支，每轮多等 `STABLE_NORMAL`（2.5 秒）。
+      实测每轮中位 13 秒，其中约 5 秒是这段尾部等待。
+
+    ★ 要提速的话，正确的下一步是**先量**（用 `_trunc_probe.py`）：
+      「回答被截断时，继续生成按钮落后文本停长多少秒」。
+      只要那个数 < STABLE_NORMAL，就说明那段 2× 兜底可以安全去掉。
+      **在量出来之前不要动它** —— 这 2.5 秒买的是「绝不交半截回答」。
+    """
     items = answers(page)
     if not items:
         return False
@@ -1116,8 +1165,13 @@ def _emit(on_delta, text):
 
 # 思考标题行**还没写完**时的样子：开头像标题，但整段还没有换行。
 # 见 streamable_prefix 的说明 —— 这种时候先别吐。
-_HEADER_PENDING_RE = re.compile(
-    r'^\s*(已深度思考|深度思考|思考中|正在思考|已思考|Thought about|Thinking)[^\n]*$')
+#
+# ★ 用**和 THINK_HEADER_RE 同一套词汇表**派生，不是另写一份。
+#   这两个正则是一对：一个删标题、一个「标题还没到齐先压住不吐」。
+#   词汇表要是走岔（比如这里仍用旧的长度判据），就会出现「clean() 不删、
+#   这里却压住」的错位 —— 正文被扣着不发，得等换行或者流结束才补上。
+#   「同一个职责两份实现 = 迟早改漏一份」在这个项目里已经犯过四次了。
+_HEADER_PENDING_RE = re.compile(rf'^[ \t]*{_THINK_HEAD}{_THINK_TAIL}\Z')
 
 
 def streamable_prefix(text):

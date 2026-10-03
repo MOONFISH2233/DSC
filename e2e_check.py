@@ -179,6 +179,20 @@ def main():
     ap.add_argument('--rounds', type=int, default=MAX_ROUNDS)
     args = ap.parse_args()
 
+    # ★ 开跑前先清空临时目录（第十八轮补）。
+    #
+    # 原来只在**结束时**清、而且 `--keep` 时不清理 —— 于是 `--keep` 留下的
+    # 成品（gen_report.py + 已生成的 docx）会改变**下一轮任务**的起始条件：
+    # 模型 Get-ChildItem 看见文件已经在了，就转去「改它 / 验证它」而不是写它，
+    # 于是轮数暴涨、Write 反复重写、半路撞上长度上限 → `缺 content` → **假红**。
+    #
+    # 实测代价：同一份代码，脏目录跑 3 次红 2 次，干净目录跑 3 次全绿。
+    # 假红的代价极高 —— 它会让人去改根本没坏的代码（这轮就差点）。
+    #
+    # 注意「开始时清」和 `--keep` 不冲突：`--keep` 的语义是**跑完别删**，
+    # 不是「别动我上次的产物」。要留着上一次的，就先自己拷走。
+    import shutil as _shutil
+    _shutil.rmtree(TMP_DIR, ignore_errors=True)
     os.makedirs(TMP_DIR, exist_ok=True)
     outfile = os.path.join(TMP_DIR, 'gen_report.py')
 

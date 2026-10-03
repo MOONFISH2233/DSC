@@ -1113,6 +1113,58 @@ def test_unit():
     check('ask_web 里是「不等于警告才 raise」', 'err != ds.TRUNCATED_WARN' in src,
           '直接 if err: raise 的话，警告会被当成失败 → 本来能用的回答变 500')
 
+    # ── 完成判定里的保守兜底：**别在没量之前删掉它**（第十八轮）──
+    #
+    # ★ wait_answer 里那条
+    #       cache['done_seen'] or stable_for >= stable_need * 2
+    #   因为 answer_done_rendered() 恒为 False（操作栏在祖父节点，见那边的
+    #   说明），永远走右边 —— 每轮多等 2.5 秒，占总耗时约 5/13。
+    #
+    #   它**看着像纯浪费，其实是买「绝不交半截回答」的保险费**：
+    #   回答被截断时，「继续生成」按钮需要时间渲染，窗口太短就会把半截
+    #   回答当成品交出去（缺陷 20 / 42 / 45 全是这一类）。
+    #
+    #   要提速，正确顺序是先用 `_trunc_probe.py` 量出「按钮落后文本停长
+    #   多少秒」，确认 < STABLE_NORMAL 之后再动。删之前请先量。
+    _dsrc2 = open(os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                               'deepseek_ask.py'), encoding='utf-8').read()
+    check('★ 完成判定的保守兜底还在（stable_need * 2）',
+          'stable_need * 2' in _dsrc2,
+          '被删了 —— 先跑 _trunc_probe.py 量出按钮延迟，确认安全再删')
+
+    # ── 第十八轮：思考标题的清洗判据 ──
+    #
+    # ★★ 下面第一组是第十八轮的**原发现场**。旧判据是
+    #    「关键词 + [^\n]{0,40} + 换行」，翻译过来就是「只要这行够短就整行删掉」——
+    #    它删的是**用户的正文首行**，不是 DeepSeek 的思考块。
+    #    不报错、日志干净、自测全绿，只有打开回答才发现首行没了 ——
+    #    静默数据损坏，这个项目最怕的一类。所以这组用例是钉子，不是装饰。
+    section('单元 · 思考标题清洗（只删元数据行，不删正文首行）')
+    _cl = ds_init.clean
+
+    for _raw, _head in [
+            ('思考中台是一种架构\n第二行内容', '思考中台是一种架构'),
+            ('深度思考是一种方法论\n正文', '深度思考是一种方法论'),
+            ('正在思考这个问题的人很多\n正文', '正在思考这个问题的人很多'),
+            ('已思考的部分先放一边\n正文', '已思考的部分先放一边'),
+            ('Thinking about it, the answer is 42.\nMore text.',
+             'Thinking about it, the answer is 42.'),
+    ]:
+        check(f'★ 正文首行保住：{_head}', _cl(_raw).split('\n')[0] == _head,
+              repr(_cl(_raw)))
+
+    # 功能不能丢：真的标题行**整行都是元数据**，还是要删干净
+    for _raw, _want in [
+            ('已深度思考（用时 12 秒）\n\n正文在此', '正文在此'),
+            ('已深度思考(用时 12 秒)\n\n正文在此', '正文在此'),
+            ('已深度思考（用时 1 分 12 秒）\n\n正文在此', '正文在此'),
+            ('思考中\n正文在此', '正文在此'),
+            ('思考中...\n正文在此', '正文在此'),
+            ('Thinking for 12 seconds\nHere is the answer.', 'Here is the answer.'),
+    ]:
+        check(f'真标题仍删掉：{_raw.splitlines()[0]}', _cl(_raw) == _want,
+              repr(_cl(_raw)))
+
     # ── 伪流式：能吐的前缀 ──
     section('单元 · 伪流式（可吐前缀）')
     sp = ds_init.streamable_prefix
@@ -1136,6 +1188,41 @@ def test_unit():
     #   压住是安全的：真等不到换行，_finish_stream 会把结尾补上。
     check('★ 标题行还没写完时先压住不吐',
           sp('已深度思考（用时 3') == '', repr(sp('已深度思考（用时 3')))
+
+    # ★ 结构锁：「删标题」和「标题没到齐先压住」是**一对**，必须共用一份词汇表。
+    #   各写一份的话迟早走岔 —— 走岔的后果是正文被白白扣着不发
+    #   （流式只能加不能减，扣错了补不回来）。
+    #   「同一个职责两份实现 = 迟早改漏一份」，这个项目已经犯过四次。
+    _dsrc = open(os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                              'deepseek_ask.py'), encoding='utf-8').read()
+    _pend = _dsrc.split('_HEADER_PENDING_RE = re.compile(')[-1][:120]
+    check('★ 两个正则共用同一份词汇表（pending 不是自己又写一份关键词）',
+          '_THINK_HEAD' in _pend and '_THINK_TAIL' in _pend,
+          f'pending 正则长这样：{_pend.splitlines()[0]!r}')
+
+    # ★ 契约：pending 压住的那一行，**到齐之后必须真的会被 clean 删掉**。
+    #   压住的前提就是「等它长完再删」；长完了却不删，那段正文就白扣了。
+    for _t in ('已深度思考（用时 3', '已深度思考（用时 12 秒）',
+               '思考中...', 'Thinking for 1'):
+        check(f'pending 压住的「{_t}」到齐后确实会被删掉',
+              sp(_t) == '' and _t not in _cl(_t + '\n正文'),
+              repr((sp(_t), _cl(_t + '\n正文'))))
+
+    # 反向：clean() **不删**的正文，pending 也不许压住 ——
+    # 旧版这里返回空串，正文被扣着，要等换行或流结束才补上。
+    for _t in ('思考中台是一种架构', 'Thinking about it, the answer is 42.'):
+        check(f'★ clean() 不删的正文，pending 也不压住：{_t}', sp(_t) == _t,
+              repr(sp(_t)))
+
+    # ★ 缺陷 49 的教训：流式吐的必须和非流式喂给上游的是**同一份文本**。
+    #   两条路都走 clean()，但走法不同（一个整段、一个按前缀逐次）——
+    #   判据一改就可能只有一条路跟着变。这里逐条对拍，就是钉这个。
+    for _raw in ('已深度思考（用时 12 秒）\n\n正文在此',
+                 '思考中台是一种架构\n第二行内容',
+                 'Thinking about it, the answer is 42.\nMore text.',
+                 '思考中\n正文在此'):
+        check(f'流式与非流式产出同一份：{_raw.splitlines()[0][:14]}',
+              sp(_raw) == _cl(_raw), f'sp={sp(_raw)!r} clean={_cl(_raw)!r}')
 
     # ── 伪流式：差量算法 ──
     section('单元 · 伪流式（差量不重复）')
