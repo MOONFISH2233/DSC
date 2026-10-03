@@ -462,6 +462,15 @@ def test_unit():
           and 'EnterPlanMode' in cs.build_prompt('你是助手', _msgs, _t))
     check('没有工具时全程不提这些工具（免得模型凭空编）',
           'AskUserQuestion' not in cs.build_prompt('你是助手', _msgs, []))
+    # ★★ 第十八轮补：`build_prompt` 的**开头**分了岔（OUTPUT_RULES_NO_TOOLS），
+    #   但**结尾**那句「然后输出 JSON」是无条件的 —— 同一段提示词两句话打架。
+    #   实测模型整条回复都在跟我们吵架，正经答案挤在最后。
+    #   ★ 旧自测只查了「无工具时不返回 tool_use」（结构），没查提示词自洽（质量）。
+    _p_no = cs.build_prompt('你是助手', _msgs, [])
+    check('★ 无工具时 build_prompt 也不能要求「输出 JSON」（首尾要一致）',
+          '输出 JSON' not in _p_no, repr(_p_no[-130:]))
+    check('★ 无工具时 build_prompt 要明说直接用文字答',
+          '不要包 JSON' in _p_no, repr(_p_no[-130:]))
     # delta 是**每轮**都走的路径，规则只在第一轮出现的话，模型第二轮就忘光了
     _d = cs.build_delta_prompt(_msgs)
     check('★ delta 路径也带压缩版引导（否则第二轮起就忘光）',
@@ -471,6 +480,33 @@ def test_unit():
     #   后续轮次。这正是第十五轮补 缺陷 34 的同一个坑（规则只在第一轮出现）。
     check('★ delta 路径也提醒工具名（跑命令那个叫 PowerShell）',
           'PowerShell' in _d, _d[:150])
+
+    # ★★ 第十八轮补：delta 路径**必须跟着 tools 分岔**。
+    #
+    #   build_prompt 早就分了（有工具 / 没工具两套输出规则），而 delta 没跟 ——
+    #   于是没有工具的请求里，同一段提示词一边写「不要包 JSON、不要尝试调用工具」，
+    #   一边写「先说明你要做什么，然后输出 JSON（工具调用或最终回答）」。
+    #   实测模型的回答整个跑偏，把自己那点输出预算全花在**跟我们吵架**上：
+    #     「我不能按这个要求做 —— 你前面说『只回答两个字』，后面又要求先说明
+    #       再输出 JSON，这两条互相冲突，而且本次明确不允许调用工具」
+    #
+    #   ★ 下面这条断言的是**质量**，不是结构 —— 旧自测只断言
+    #     「无工具时不返回 tool_use」（结构对了），所以这个 bug 一路绿灯。
+    _d_no = cs.build_delta_prompt(_msgs, [])
+    check('★ 无工具时 delta 不能再要求「输出 JSON」（会让模型跟我们吵架）',
+          '输出 JSON' not in _d_no, _d_no[-140:])
+    check('★ 无工具时 delta 要明说直接用文字答',
+          '不要包 JSON' in _d_no or '直接用' in _d_no, repr(_d_no[-120:]))
+    check('无工具时 delta 也不提那些工具（免得模型凭空编）',
+          'AskUserQuestion' not in _d_no and 'PowerShell' not in _d_no,
+          repr(_d_no[-160:]))
+    # 有工具时行为不变（别为了修这个把工具引导弄丢）
+    _d_yes = cs.build_delta_prompt(_msgs, _t)
+    check('有工具时 delta 照旧要求 JSON + 带引导',
+          '输出 JSON' in _d_yes and 'AskUserQuestion' in _d_yes)
+    # 不传 tools → 老行为（自测和旧调用点靠这个）
+    check('不传 tools 时 delta 行为不变（向后兼容）',
+          cs.build_delta_prompt(_msgs) == _d_yes)
 
     section('单元 · 工具名认错（Bash → PowerShell）')
     # ★ 回归（真实使用实测）：模型写对了 PowerShell 命令，**唯独名字叫成了 Bash**

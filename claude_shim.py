@@ -487,7 +487,23 @@ def build_prompt(system, messages, tools):
         head = f'（前 {total - MAX_HISTORY_MSGS} 条较早的对话已省略）\n\n' if trimmed else ''
         parts.append('═══ 对话历史 ═══\n' + head + '\n\n'.join(convo))
 
-    parts.append('现在轮到你（助手）回复。记住：先一句话说明你要做什么，然后输出 JSON。')
+    # ★★ 收尾这句也**必须跟着 tools 分岔**（第十八轮补）。
+    #
+    #   上面 OUTPUT_RULES_NO_TOOLS 已经说了「不要包 JSON、不要尝试调用工具」，
+    #   而这一句原先无条件写「然后输出 JSON」—— 同一段提示词里两句话打架。
+    #   实测（冒烟测试）模型整条回复都在**跟我们吵架**：
+    #       「我不能按这个要求做 —— 你前面说『只回答两个字：收到』，后面又要求
+    #         先说明再输出 JSON，这两条互相冲突，而且本次明确不允许调用工具」
+    #   正经答案被挤到最后一句。
+    #
+    #   ★ 为什么容易漏：`build_prompt` 里那个 `OUTPUT_RULES if tools else ...`
+    #     的分岔看着像「已经处理过了」，于是**开头处理了、结尾忘了**。
+    #     同一个错在这一版里出现了**三处**（build_prompt 结尾、build_delta_prompt
+    #     的 JSON 那句、以及 delta 的工具引导）—— 典型的「分岔只做了一半」。
+    parts.append('现在轮到你（助手）回复。记住：先一句话说明你要做什么，然后输出 JSON。'
+                 if tools else
+                 '现在轮到你（助手）回复。**这次没有配置任何工具**，'
+                 '直接用正常的 Markdown 回答就行，不要包 JSON、不要尝试调用工具。')
 
     text = '\n\n'.join(parts)
     if len(text) > MAX_PROMPT_CHARS:
@@ -1285,25 +1301,31 @@ def decide_prompt(messages, info, system, tools):
         sent = info.get('sent', 0)
         if len(messages) > sent:
             new_msgs = messages[sent:]
-            return (build_delta_prompt(new_msgs), info['web_url'], new_msgs,
+            return (build_delta_prompt(new_msgs, tools), info['web_url'], new_msgs,
                     f'复用网页对话 · 增量 {len(new_msgs)} 条')
         if len(messages) == sent:
             # 没有新消息（少见，通常是上游重发同一份）—— 把最后一条再发一次。
             # 早先这里会落进下面的「压缩」分支，日志谎报「压缩过（49 → 49）」
             # 而且把最近 6 条重发一遍，白白往对话里灌重复内容。
             new_msgs = messages[-1:]
-            return (build_delta_prompt(new_msgs), info['web_url'], new_msgs,
+            return (build_delta_prompt(new_msgs, tools), info['web_url'], new_msgs,
                     f'没有新消息（{sent} 条），重发最后一条')
         # 真的变少了 = 上下文被压缩或回退过：计数对不上，但对话必须接着用。
         new_msgs = messages[-REBASE_MSGS:]
-        return (build_delta_prompt(new_msgs), info['web_url'], new_msgs,
+        return (build_delta_prompt(new_msgs, tools), info['web_url'], new_msgs,
                 f'复用网页对话 · 上下文压缩过（{sent} → {len(messages)}），'
                 f'改发最近 {len(new_msgs)} 条')
     return (build_prompt(system, messages, tools), None, messages, '新会话')
 
 
-def build_delta_prompt(new_msgs):
-    """只把「新增的那几条」发给已经在进行中的网页对话。"""
+def build_delta_prompt(new_msgs, tools=None):
+    """
+    只把「新增的那几条」发给已经在进行中的网页对话。
+
+    tools 的约定：**None = 不知道，按老行为（当有工具）**；传 [] = 明确没有工具。
+    ★ 为什么这么定：这个参数是后加的，老调用点（和自测里那几处）都不传 ——
+      让 None 走老路，它们的行为一个字都不变。
+    """
     parts = []
     for m in new_msgs:
         content = m.get('content')
@@ -1317,6 +1339,27 @@ def build_delta_prompt(new_msgs):
         parts.append(f'【{who}】\n{text}')
     if not parts:
         return '继续。'
+
+    # ★★ 没有工具时**绝不能**再说「然后输出 JSON」（第十八轮补）。
+    #
+    #   `build_prompt` 早就分了岔（有工具用 OUTPUT_RULES、没工具用
+    #   OUTPUT_RULES_NO_TOOLS），但**这条 delta 路径没跟着分** ——
+    #   而 delta 才是**每轮都走**的那条。
+    #   后果：同一段提示词里一边写着「不要包 JSON、不要尝试调用工具」，
+    #   另一边写着「先一句话说明你要做什么，然后输出 JSON（工具调用或最终回答）」。
+    #   实测（冒烟测试）模型的回答整个跑偏：
+    #       「我不能按这个要求做 —— 你前面说『只回答两个字』，后面又要求
+    #         先说明再输出 JSON，这两条互相冲突，而且本次明确不允许调用工具」
+    #   它把自己那点输出预算全花在**跟我们吵架**上了，正经答案挤在最后。
+    #
+    #   这是这个项目第六次「同一个职责两份实现」：分岔只做了一半。
+    #   自测当时也是绿的 —— 它只断言「无工具时不返回 tool_use」，
+    #   不断言**回答还正不正常**。结构对了、质量没了。
+    if tools is not None and not tools:
+        return ('═══ 继续 ═══\n\n' + '\n\n'.join(parts) +
+                '\n\n继续。**这次没有配置任何工具**，直接用正常的 Markdown 回答就行，'
+                '不要包 JSON、不要尝试调用工具。')
+
     return ('═══ 继续 ═══\n\n' + '\n\n'.join(parts) +
             '\n\n继续。记住：先一句话说明你要做什么，然后输出 JSON（工具调用或最终回答）。\n'
             # ★ 工具引导在这儿只留压缩版：delta 是**每轮**都走的路径，而完整版
