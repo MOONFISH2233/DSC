@@ -1166,17 +1166,31 @@ def incomplete_tool(tools):
     return None
 
 
-def retry_reason(parsed, tools):
+# 「模型压根没写正文」和「写到一半被截断」的分界（第十八轮补）。
+#
+# 两种情况的**现象一样**（Write 缺 content），但原因和建议完全不同：
+#   短 + 没有代码块  → 模型只给了 file_path，正文一个字没写
+#   长 / 有代码块    → 真的是被网页长度上限截断了
+#
+# 实测（16 份现场）：没写正文的那批是 147~341 字，被截断的那批是 2 万字上下，
+# 中间空得很，2000 是个安全的分界。
+OMITTED_BODY_CHARS = 2000
+
+
+def retry_reason(parsed, tools, raw=None):
     """
     这条回复为什么**不能**就这么交给上游。返回 None = 可以放行。
 
     两类问题，都得重问（最多 MAX_RETRIES 次）：
       ① 看着像写坏了的工具调用（JSON 转义炸了）—— 见 should_retry()
-      ② 解析出了工具调用，但必填的长字段是空的 —— 典型是 Write 没有 content，
-         根因通常是回复被网页的输出长度上限截断了
+      ② 解析出了工具调用，但必填的长字段是空的 —— 典型是 Write 没有 content
 
     抽成一个函数是为了**能测**：这两条规则原先散在 HTTP handler 里，
     selftest 够不着，正是当初能悄悄塞进一个错误闸门的原因。
+
+    raw 传原始回复时，②还能再分出「被截断」和「压根没写」两种 —— 见
+    OMITTED_BODY_CHARS。不传就按「被截断」给建议（保守：那套建议对两种情况
+    都不算错，只是对「没写」那种不够对症）。
     """
     if should_retry(parsed, tools):
         return ('你上一条回复不是合法 JSON —— 长文本塞进字符串时转义出错了。'
@@ -1219,6 +1233,24 @@ def retry_reason(parsed, tools):
                 '```\n（这里原样写命令，引号照写）\n```\n'
                 '不要为了塞进 JSON 字符串去转义引号 —— 实测转义一错整个调用就废。'
                 % (bad.get('name'), field, bad.get('name')))
+
+    # ★ 「缺 content」有**两种完全不同的原因**，给的建议也必须不同（第十八轮补）。
+    #
+    #   原来只有下面那套「你被长度上限截断了，要分段写」—— 而实测 16 份现场里
+    #   有 6 份只有 147~341 字，离任何长度上限都远得很：模型只是**说了句
+    #   「现在写 X」、给了个路径，正文一个字都没写**。
+    #   给这种回复发「你被截断了、要分段」是**错误的诊断**，模型会以为自己已经
+    #   写了一半、去纠结怎么分段。实测同一形状**连着重试 3 轮**，
+    #   三次回复是 147/151/147 字，几乎一模一样 —— 提示词没起作用。
+    if raw is not None and len(raw) < OMITTED_BODY_CHARS and '```' not in raw:
+        return ('你上一条回复**只给了 %s，正文一个字都没写** —— 不是被截断，'
+                '就是漏了。这种调用发出去必然失败。\n\n'
+                '**正文必须原样放在 JSON 后面的代码块里**（这是硬要求，不能省）：\n'
+                '{"tool_use": {"name": "%s", "input": {"file_path": "..."}}}\n'
+                '```\n（这里原样写文件内容，多少字都行，一个字符都不用转义）\n```\n\n'
+                '★ 别把内容塞进 JSON 字符串（转义一错整个调用就废），'
+                '也别只给路径就完事。'
+                % (field, bad.get('name')))
 
     return ('你上一条回复**被网页的长度上限截断了** —— 工具调用只写了一半：'
             '要调 %s，但 %s 是空的。这种调用发出去必然失败。\n\n'
@@ -1850,23 +1882,33 @@ class Handler(BaseHTTPRequestHandler):
         #   那一轮没有工具可调、会话就停在提示符上等用户手打「继续」。
         #   有界重试的形状照抄 deepseek_ask.ensure_browser。
         for attempt in range(1, MAX_RETRIES + 1):
-            reason = retry_reason(parsed, tools)
+            reason = retry_reason(parsed, tools, raw)
             if not reason:
                 break
 
             _bad = incomplete_tool(parsed[1]) if parsed[0] == 'tools' else None
+
+            # ★ 原始回复**两种重试都要记**，而且记在分支外面。
+            #   光记一句「缺 content」是查不出原因的 —— 到底是「回复被网页截断了」
+            #   还是「我们把内容挂错了地方」还是「模型根本没写正文」，
+            #   现象一模一样。把原文的头尾和围栏数量记下来，一眼就能分辨：
+            #     结尾没有闭合围栏 + 括号不配平 → 网页截断（真的没写完）
+            #     围栏数量不对                  → 是我们切错了（见 _remove_tool_call_span）
+            #     很短 + 围栏 0 个              → 模型只给了路径、正文一个字没写
+            #
+            #   ★ 第十八轮补：原先只有「缺字段」那条记原文，而**占重试 77%
+            #     的是另一条**（「输出像是坏掉的工具调用」，实测两天 63 次）——
+            #     它只留了个名字、没有现场，排查时只能靠猜。收到分支外面，
+            #     两种都留下现场。
+            ds.log('[重试] 原始回复 %d 字 · 围栏 %d 个 · 头 %r · 尾 %r'
+                   % (len(raw), raw.count('```'), raw[:90], raw[-90:]))
             if _bad:
-                ds.log('[重试] 第 %d/%d 次：%s 缺 %s（多半是被长度上限截断了），'
-                       '重新问一次'
+                # ★ 去掉「（多半是被长度上限截断了）」那句 —— 实测它**经常是错的**：
+                #   16 份现场里 6 份只有 147~341 字，离任何长度上限都远得很。
+                #   真正的原因是模型只给了路径、正文没写。诊断写在日志里会被当成事实。
+                ds.log('[重试] 第 %d/%d 次：%s 缺 %s，重新问一次'
                        % (attempt, MAX_RETRIES, _bad.get('name'),
                           _BLOCK_FIELD.get(_bad.get('name'))))
-                # ★ 光记「缺 content」是查不出原因的 —— 到底是「回复被网页截断了」
-                #   还是「我们把内容挂错了地方」，两者的现象一模一样。
-                #   把原文的头尾和围栏数量记下来，一眼就能分辨：
-                #     结尾没有闭合围栏 + 括号不配平 → 网页截断（真的没写完）
-                #     围栏数量不对            → 是我们切错了（见 _remove_tool_call_span）
-                ds.log('[重试] 原始回复 %d 字 · 围栏 %d 个 · 头 %r · 尾 %r'
-                       % (len(raw), raw.count('```'), raw[:90], raw[-90:]))
             else:
                 ds.log('[重试] 第 %d/%d 次：输出像是坏掉的工具调用，重新问一次'
                        % (attempt, MAX_RETRIES))
@@ -1924,7 +1966,7 @@ class Handler(BaseHTTPRequestHandler):
                 #   重试，两次都这样就是 500。实测日志正是这个形状（见
                 #   parse_and_align 的说明）。
                 p2 = parse_and_align(raw2, tools)
-                if not retry_reason(p2, tools):
+                if not retry_reason(p2, tools, raw2):
                     parsed, raw = p2, raw2
                     # ★ web_url 刻意不更新 —— 重试用的是临时对话，
                     #   主对话还是原来那个，下一轮继续在它上面接着聊。
@@ -1944,7 +1986,7 @@ class Handler(BaseHTTPRequestHandler):
         #   改成报 5xx，让 Claude Code 自己的退避重试接管：它重发同一个请求时，
         #   decide_prompt 会走「没有新消息 → 重发最后一条」，在**同一个网页对话**
         #   里重问一次（对话历史不丢），等于自动替用户说了「继续」。
-        if retry_reason(parsed, tools):
+        if retry_reason(parsed, tools, raw):
             ds.log('[重试] %d 次都没修好，返回 500 交给上游重试。原始回复：%r'
                    % (MAX_RETRIES, raw[:400]))
             self._fail(500,

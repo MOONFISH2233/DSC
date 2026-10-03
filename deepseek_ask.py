@@ -176,9 +176,16 @@ SEL = {
     # 它只匹配 AI 回答、不匹配用户提问 —— 正是我们要的。
     # （方案里猜的 ds-markdown--block 根本不存在，害我查了半天。）
     'answer_body': 'css:.ds-assistant-message-main-content',
-    # 回答下方那排操作按钮（复制/重新生成/点赞/朗读…），是正文的兄弟节点，
-    # 生成结束才会渲染 —— 所以它出现就等于「这条回答写完了」。
-    # 锚定设计系统类名，不用 ds-flex（太通用，实测误匹配 3 个）也不用哈希类名。
+    # 回答下方那排操作按钮（复制/重新生成/点赞/朗读…）。
+    #
+    # ⚠️ **它不能用来判「回答写完了」**（第十八轮实测推翻了这个假设）：
+    #    新回答**一边流式增长一边就已经带着操作栏**（t=0.0 时 161 字、按钮已在）。
+    #    早先 `answer_done_rendered()` 拿它当完成判据，而那个函数因为查错层级
+    #    恒为 False —— 恒 False 反而是幸运的，真「修好」了会每次回答都截断。
+    #    该函数已删，说明留在 `wait_answer` 阶段 2 的注释里。
+    #
+    # 这条选择器现在**只留给 --probe 做存活诊断**（网页改版时能看出它还在不在），
+    # 不再参与任何完成判定。锚定设计系统类名，不用 ds-flex（太通用，实测误匹配 3 个）。
     'action_button': 'css:.ds-button--iconLabelTertiary',
     # 实测：带 aria-pressed 的是外层 div（class 含 ds-toggle-button），
     # 而 'text:深度思考' 只会匹配到内层那个没状态的 span —— 所以必须先按类名
@@ -801,45 +808,6 @@ def click_continue(page, tries=CONTINUE_CLICK_TRIES):
     return False
 
 
-def answer_done_rendered(page):
-    """
-    最后一条 AI 回答下方的操作栏渲染出来了没有。
-
-    ⚠️⚠️ **别「修」这个函数 —— 它现在恒为 False，而这是安全的。** ⚠️⚠️
-
-    第十八轮实测（`_action_bar_probe.py` / `_done_signal_probe.py`）：
-
-    · 操作栏的真实位置在**祖父节点**，不是父节点 ——
-        ↑0  .ds-markdown.ds-assistant-message-main-content   操作栏 0 个
-        ↑1  .ds-message                                    操作栏 0 个  ← 本函数查的就是这层
-        ↑2  ._4f9bf79 …（每条消息自己的容器）                操作栏 6 个  ← 真在这
-        ↑3  .ds-virtual-list-visible-items                  操作栏 14 个（含**所有**可见消息）
-      所以 `parent()` 永远查不到 → 本函数永远返回 False。
-
-    · **但「修好」它会造成静默截断。** 实测：新回答**一边流式增长一边就已经
-      带着操作栏**（t=0.0 时 161 字、按钮已在；t=1.0 长到 368 字才停）。
-      也就是说操作栏根本不是「生成结束」的信号 —— 拿它当判据会在
-      **第一个轮询**就宣布写完，交出去半截回答。而半截回答是这个项目
-      最怕的一类失败（缺陷 20 / 42 / 45 全是它）。
-
-    · 它恒为 False 的代价只是**慢**：`wait_answer` 里那条
-        `cache['done_seen'] or stable_for >= stable_need * 2`
-      于是永远走右边的保守分支，每轮多等 `STABLE_NORMAL`（2.5 秒）。
-      实测每轮中位 13 秒，其中约 5 秒是这段尾部等待。
-
-    ★ 要提速的话，正确的下一步是**先量**（用 `_trunc_probe.py`）：
-      「回答被截断时，继续生成按钮落后文本停长多少秒」。
-      只要那个数 < STABLE_NORMAL，就说明那段 2× 兜底可以安全去掉。
-      **在量出来之前不要动它** —— 这 2.5 秒买的是「绝不交半截回答」。
-    """
-    items = answers(page)
-    if not items:
-        return False
-    try:
-        return bool(items[-1].parent().ele(SEL['action_button'], timeout=0))
-    except Exception:
-        return False
-
 
 def clean(text):
     return THINK_HEADER_RE.sub('', text or '').strip()
@@ -1260,11 +1228,27 @@ def wait_answer(page, baseline, think, start_limit=None, total_limit=None,
     continues = 0
     t_start = time.time()
     deadline = t_start + total_limit
-    # ★ 两个缓存，都是为了省 CDP 往返：
-    #   done_seen     —— answer_done_rendered 一旦 True 就不会变回 False
-    #                    （操作栏渲染出来就一直在），没必要每轮重查。
-    #   last_btn_scan —— 「继续生成」按钮降频，见 CONTINUE_SCAN_INTERVAL。
-    cache = {'done_seen': False, 'last_btn_scan': 0.0}
+    # ★ last_btn_scan —— 「继续生成」按钮降频，见 CONTINUE_SCAN_INTERVAL。
+    #
+    # ★★ 这里**没有**「操作栏渲染出来了 = 写完了」那条快判据了（第十八轮附删的）。
+    #    它曾经存在，但 `answer_done_rendered()` 恒为 False（操作栏在祖父节点、
+    #    代码查的是父节点），于是永远走 `stable_need * 2` 那条保守分支 ——
+    #    每轮白等 2.5 秒（一轮中位 13 秒，占 ~19%），而且那个函数**每轮询一次
+    #    就查一次**（缓存只在返回 True 时才生效，而它从不返回 True）。
+    #
+    #    为什么不「把它修好」：实测**新回答一边流式增长、一边就已经带着操作栏**
+    #    （t=0.0 时 161 字、按钮已在；t=1.0 长到 368 字才停）。操作栏根本不是
+    #    「生成结束」的信号 —— 拿它当判据会在**第一个轮询**就宣布写完，
+    #    把半截回答交出去。那个 parent() 的「bug」当时是护着我们的。
+    #
+    #    ★ 为什么现在敢只用 stable_need（`_trunc_probe.py` 实测）：
+    #        · 生成途中文本几乎不停顿 —— 5 个回答 46 个变长间隔，最大 0.16 秒
+    #        · 被截断时「继续生成」按钮**落后文本停长 +0.00 秒**就出现
+    #          （14212 字处截断，按钮与末次变长落在同一个采样点）
+    #      两个数都比 stable_need（2.5 秒）小一个数量级，所以这 2.5 秒
+    #      买的是「绝不交半截回答」的保险，而不是在等某个信号。
+    #      **要再降这个窗口，先重跑 _trunc_probe.py 量一遍按钮延迟。**
+    cache = {'last_btn_scan': 0.0}
     while time.time() < deadline:
         time.sleep(_poll_interval(t_start))
 
@@ -1278,14 +1262,9 @@ def wait_answer(page, baseline, think, start_limit=None, total_limit=None,
             continue
 
         stable_for = time.time() - last_change
-        if stable_for < stable_need:
+        if stable_for < stable_need:                 # ② 还没稳，继续等
             continue
         if not txt.strip():                          # ① 空结果不算数
-            continue
-        # ② 还没稳，继续等。操作栏查过一次是真的就不再重复查（见 cache 说明）。
-        if not cache['done_seen']:
-            cache['done_seen'] = answer_done_rendered(page)
-        if not (cache['done_seen'] or stable_for >= stable_need * 2):
             continue
 
         # ★ 文本稳了，但**未必是真的答完了** —— 也可能是页面弹了

@@ -644,6 +644,32 @@ def test_unit():
     check('★ 重试提示里要说清怎么分段写',
           '分段' in (cs.retry_reason(no_content, WT) or '')
           or '分几段' in (cs.retry_reason(no_content, WT) or ''))
+
+    # ★ 第十八轮补：「缺 content」有**两种原因**，建议必须分开。
+    #   实测 16 份现场里有 6 份只有 147~341 字 —— 那不是被截断，
+    #   是模型只给了路径、正文一个字没写。给这种回「你被截断了、要分段写」
+    #   是**错误诊断**：模型会以为自己写了一半，实测同一形状连着重试 3 轮
+    #   （147/151/147 字，几乎一样），提示词完全没起作用。
+    short_omitted = ('现在写对照实验脚本。\n\n'
+                     '{"tool_use": [{"name": "Write", "input": '
+                     '{"file_path": "D:' + chr(92) + 'a.py"}}]}')
+    _hint_short = cs.retry_reason(no_content, WT, short_omitted) or ''
+    check('★ 短回复 + 没代码块 → 判成「正文一个字没写」，不是「被截断」',
+          '一个字都没写' in _hint_short, repr(_hint_short[:90]))
+    check('★ 而且不能再劝它「分段写」（那是错的诊断）',
+          '分几段' not in _hint_short and '分段' not in _hint_short,
+          repr(_hint_short[:120]))
+    # 长回复 / 带代码块 → 仍旧按「被截断」给分段建议
+    _hint_long = cs.retry_reason(no_content, WT,
+                                 '我这就写。\n' + 'x' * 3000) or ''
+    check('长回复仍判「被截断」并给分段建议',
+          '分几段' in _hint_long, repr(_hint_long[:90]))
+    _hint_fence = cs.retry_reason(no_content, WT, '我这就写。\n```python\n' + 'x' * 100 + '\n```') or ''
+    check('带代码块的仍判「被截断」（说明它确实想写内容）',
+          '分几段' in _hint_fence, repr(_hint_fence[:90]))
+    # 不传 raw 时退回「被截断」那套（selftest 和 _clean_impact 的旧调用点靠这个）
+    check('不传 raw 时行为不变（向后兼容）',
+          '分几段' in (cs.retry_reason(no_content, WT) or ''))
     check('Write 有 content 就不算缺',
           cs.incomplete_tool([{'name': 'Write',
                                'input': {'file_path': 'D:' + chr(92) + 'a.py',
@@ -857,7 +883,7 @@ def test_unit():
     #   这里用假页面 + 缩短的时间常数测：点完 0.6 秒后才出现新内容，
     #   两次点击的间隔就必须 ≥ 这个延迟。旧代码会在 0.2 秒内就点第二次。
     import deepseek_ask as dsc
-    _saved = (dsc.last_answer_text, dsc.answer_done_rendered, dsc.find_continue_button,
+    _saved = (dsc.last_answer_text, dsc.find_continue_button,
               dsc.click_continue, dsc.STABLE_NORMAL, dsc.POLL, dsc.MAX_CONTINUES)
     GEN_DELAY = 0.6                 # 模拟「点完 0.6 秒后新内容才出现」
     st = {'text': 'X' * 200, 'clicks': [], 'append_at': None}
@@ -876,7 +902,6 @@ def test_unit():
     _btn = _Btn()
     try:
         dsc.last_answer_text = _fake_text
-        dsc.answer_done_rendered = lambda _p: True
         dsc.find_continue_button = lambda _p: _btn
         # ★ 实际点击走的是 click_continue（它内部会重抓元素、退化到 JS 点击），
         #   所以要连它一起换掉 —— 只换 find_continue_button 的话点不到假按钮。
@@ -895,7 +920,7 @@ def test_unit():
         check('★ 续写出来的内容被保住了',
               err is None and 'Y' * 50 in (txt or ''), f'{err} / {len(txt or "")} 字')
     finally:
-        (dsc.last_answer_text, dsc.answer_done_rendered, dsc.find_continue_button,
+        (dsc.last_answer_text, dsc.find_continue_button,
          dsc.click_continue, dsc.STABLE_NORMAL, dsc.POLL, dsc.MAX_CONTINUES) = _saved
 
     # ★ 回归（真实会话）：第一次点击**点了没反应**时，必须换种方式再点，
@@ -903,7 +928,7 @@ def test_unit():
     #   （React 重渲染的瞬时抖动）；更阴的一种是**点在空气上而 click() 不报错**
     #   （项目自己的坑 1）—— 那种只有等一等才知道没生效。
     #   早先两者都是直接 return，把半截回答当完整回答交出去 → 上游报「缺 content」。
-    _saved_c = (dsc.last_answer_text, dsc.answer_done_rendered, dsc.find_continue_button,
+    _saved_c = (dsc.last_answer_text, dsc.find_continue_button,
                 dsc.click_continue, dsc.STABLE_NORMAL, dsc.POLL, dsc.MAX_CONTINUES,
                 dsc.CONTINUE_WAIT, dsc.CONTINUE_CLICK_TRIES)
     st2 = {'text': 'X' * 200, 'clicks': 0, 'append_at': None}
@@ -921,7 +946,6 @@ def test_unit():
             return True
 
         dsc.last_answer_text = _fake_text2
-        dsc.answer_done_rendered = lambda _p: True
         dsc.find_continue_button = lambda _p: object()
         dsc.click_continue = _fake_click2
         dsc.STABLE_NORMAL = 0.2
@@ -937,7 +961,7 @@ def test_unit():
               err2c is None and 'Y' * 50 in (txt2c or ''),
               f'{err2c} / {len(txt2c or "")} 字')
     finally:
-        (dsc.last_answer_text, dsc.answer_done_rendered, dsc.find_continue_button,
+        (dsc.last_answer_text, dsc.find_continue_button,
          dsc.click_continue, dsc.STABLE_NORMAL, dsc.POLL, dsc.MAX_CONTINUES,
          dsc.CONTINUE_WAIT, dsc.CONTINUE_CLICK_TRIES) = _saved_c
 
@@ -946,10 +970,9 @@ def test_unit():
     #   回答**，回答气泡里只剩 `{"` 两个字。它被当成「正经回答」交给上游后，
     #   用户界面上就是一个光秃秃的 `{"`，会话卡死 —— 而且从现象里完全看不出
     #   是服务端限流（实测今天碰上 4 次）。
-    _saved2 = (dsc.last_answer_text, dsc.answer_done_rendered, dsc.find_continue_button,
+    _saved2 = (dsc.last_answer_text, dsc.find_continue_button,
                dsc.find_server_busy, dsc.STABLE_NORMAL, dsc.POLL, dsc.BUSY_MIN_CHARS)
     try:
-        dsc.answer_done_rendered = lambda _p: True
         dsc.find_continue_button = lambda _p: None
         dsc.STABLE_NORMAL = 0.2
         dsc.POLL = 0.05
@@ -976,7 +999,7 @@ def test_unit():
         check('★ 长回答不受历史繁忙气泡影响', txt3 == '这' * 200 and err3 is None,
               f'{len(txt3 or "")} 字 / {err3!r}')
     finally:
-        (dsc.last_answer_text, dsc.answer_done_rendered, dsc.find_continue_button,
+        (dsc.last_answer_text, dsc.find_continue_button,
          dsc.find_server_busy, dsc.STABLE_NORMAL, dsc.POLL, dsc.BUSY_MIN_CHARS) = _saved2
 
     section('单元 · 各 server 能加载')
@@ -1113,24 +1136,43 @@ def test_unit():
     check('ask_web 里是「不等于警告才 raise」', 'err != ds.TRUNCATED_WARN' in src,
           '直接 if err: raise 的话，警告会被当成失败 → 本来能用的回答变 500')
 
-    # ── 完成判定里的保守兜底：**别在没量之前删掉它**（第十八轮）──
+    # ── 完成判定的两条线（第十八轮附）──
     #
-    # ★ wait_answer 里那条
-    #       cache['done_seen'] or stable_for >= stable_need * 2
-    #   因为 answer_done_rendered() 恒为 False（操作栏在祖父节点，见那边的
-    #   说明），永远走右边 —— 每轮多等 2.5 秒，占总耗时约 5/13。
+    # ★ 背景：原来有一条「操作栏渲染出来 = 写完」的快判据，它让每轮走
+    #   `stable_need`（2.5 秒）；那条判据失效时退到 `stable_need * 2`（5 秒）。
+    #   实测发现 `answer_done_rendered()` **恒为 False**（操作栏在祖父节点、
+    #   代码查的是父节点），于是**永远走 5 秒那条** —— 每轮白等 2.5 秒。
     #
-    #   它**看着像纯浪费，其实是买「绝不交半截回答」的保险费**：
-    #   回答被截断时，「继续生成」按钮需要时间渲染，窗口太短就会把半截
-    #   回答当成品交出去（缺陷 20 / 42 / 45 全是这一类）。
+    #   而且：**「修好」那个函数会造成静默截断** —— 实测新回答一边流式增长
+    #   一边就已经带着操作栏（t=0.0 时 161 字、按钮已在）。拿它当判据会在
+    #   第一个轮询就宣布写完。所以删掉那条判据、只留稳定性窗口，
+    #   并在这里钉住「别把它加回来」。
     #
-    #   要提速，正确顺序是先用 `_trunc_probe.py` 量出「按钮落后文本停长
-    #   多少秒」，确认 < STABLE_NORMAL 之后再动。删之前请先量。
+    # ★ 为什么敢只用 2.5 秒（`_trunc_probe.py` 实测）：
+    #     · 生成途中文本最大停顿 0.16 秒（5 个回答 46 个间隔）
+    #     · 被截断时「继续生成」按钮落后文本停长 **+0.00 秒**出现
+    #   两个数都比 2.5 秒小一个数量级。
+    #
+    # ★ 这条锁的真正作用：**再想降窗口，就必须先重跑 _trunc_probe.py**。
+    #   把窗口降到实测的按钮延迟以下 == 每次截断都交半截回答
+    #   （缺陷 20 / 42 / 45 全是这一类）。
     _dsrc2 = open(os.path.join(os.path.dirname(os.path.abspath(__file__)),
                                'deepseek_ask.py'), encoding='utf-8').read()
-    check('★ 完成判定的保守兜底还在（stable_need * 2）',
-          'stable_need * 2' in _dsrc2,
-          '被删了 —— 先跑 _trunc_probe.py 量出按钮延迟，确认安全再删')
+    # 用 AST 找**调用**而不是找字符串 —— 注释里提到这个名字是正常的
+    # （wait_answer 里那段说明、SEL 里的警告都写着它），要找的是「谁又把它
+    # 接回完成判定了」。和上面防 parse_reply 多入口是同一招。
+    _adr_calls = [n for n in _ast.walk(_ast.parse(_dsrc2))
+                  if isinstance(n, _ast.Call)
+                  and ((isinstance(n.func, _ast.Name)
+                        and n.func.id == 'answer_done_rendered')
+                       or (isinstance(n.func, _ast.Attribute)
+                           and n.func.attr == 'answer_done_rendered'))]
+    check('★ 完成判定不再依赖操作栏（它恒为 False，且「修好」会截断）',
+          len(_adr_calls) == 0,
+          f'{len(_adr_calls)} 个调用点 —— 它一边流式增长一边就是 True，会截断')
+    check('★ 稳定性窗口没被降到实测的按钮延迟以下',
+          ds_init.STABLE_NORMAL >= 1.0 and 'stable_need' in _dsrc2,
+          f'STABLE_NORMAL={ds_init.STABLE_NORMAL} —— 降之前先跑 _trunc_probe.py 量按钮延迟')
 
     # ── 第十八轮：思考标题的清洗判据 ──
     #

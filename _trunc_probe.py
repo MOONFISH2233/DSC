@@ -20,7 +20,15 @@ import deepseek_ask as ds
 page, _ = ds.connect()
 print(f'STABLE_NORMAL={ds.STABLE_NORMAL}  2×兜底={ds.STABLE_NORMAL * 2}')
 
-q = '把整数 1 到 9000 全部原样列出来，用中文逗号分隔，一个都不能少。'
+# ★ 必须**开新对话**再逼它。上一次在累积了上下文的对话里问，
+#   模型只答了 626 字就收了（没触发截断，白等三分钟）。
+if not ds.ensure_page(page, new_chat=True):
+    print('⚠️  开新对话失败')
+    sys.exit(1)
+print('已开新对话')
+
+q = ('把整数 1 到 9000 全部原样逐个列出来，用中文逗号分隔。'
+     '不许省略、不许用省略号、不许只给代码、不许解释，直接从 1 开始写。')
 print('问题:', q)
 baseline = ds.last_answer_text(page)
 ds.send_question(page, q, baseline)
