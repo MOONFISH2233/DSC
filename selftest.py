@@ -305,6 +305,48 @@ def test_unit():
           and '结尾' in (_rf[1][0]['input'].get('content') or ''),
           repr((_rf[1][0]['input'].get('content') or '')[:80]))
 
+    # ★★ 第十八轮补四：**内容后面跟的命令块被贪婪正则吃进文件里**。
+    #
+    #   实测每次长任务都中（4 轮触发 6 次），日志里的原样：
+    #       [警告] 附上去的内容里还带围栏。长度 9127，
+    #              尾 '...run1\shim; py -3.11 big.py 2>&1; Write-Output "EXIT=$LASTEXITCODE"\n'
+    #   模型自己的叙述：「第 273 行往后混进了围栏和 JSON，是写入时多带的尾巴」
+    #   —— 它得再花好几轮把垃圾抠掉。
+    _body2 = 'def f():\n    return 1\n'
+    _junk = ('{"tool_use": {"name": "Write", "input": {"file_path": "big.py"}}}\n'
+             '```python\n' + _body2 + '```\n'
+             '文件写好了，接下来跑一下确认：\n'
+             '```powershell\ncd D:' + B + 't; py -3.11 big.py 2>&1\n```\n')
+    _rj = cs.parse_reply(_junk)
+    check('★ 内容后面的命令块不能被写进文件里',
+          _rj[0] == 'tools'
+          and (_rj[1][0]['input'].get('content') or '').strip() == _body2.strip(),
+          repr((_rj[1][0]['input'].get('content') or '')[:120])
+          if _rj[0] == 'tools' else str(_rj)[:100])
+    check('★ 也不能把围栏或命令留在内容里',
+          _rj[0] == 'tools'
+          and '```' not in (_rj[1][0]['input'].get('content') or '')
+          and 'py -3.11' not in (_rj[1][0]['input'].get('content') or ''))
+
+    # ★ 但「内容本来就带围栏」**一个字都不能动** —— 裁错就是静默截断
+    #   （写一个里面同时有 python 和 powershell 示例的 .md 就是这种）
+    _md = ('{"tool_use": {"name": "Write", "input": {"file_path": "d.md"}}}\n'
+           '```markdown\n# 标题\n\n```python\nprint(1)\n```\n\n'
+           '再来个 powershell 的例子：\n\n```powershell\nGet-Date\n```\n\n结尾\n```\n')
+    _rm = cs.parse_reply(_md)
+    _mdc = (_rm[1][0]['input'].get('content') or '') if _rm[0] == 'tools' else ''
+    check('★ 内容自带围栏时不能裁（裁了就是静默截断）',
+          'print(1)' in _mdc and 'Get-Date' in _mdc and '结尾' in _mdc,
+          repr(_mdc[:160]))
+    # 只记不改：那两种情况都要留下可统计的痕迹
+    check('trim 在判不了时返回 None（绝不猜）',
+          cs.trim_trailing_command_blocks(
+              '```markdown\n# t\n```\n```python\nprint(1)\n```\n') is None)
+    check('trim 在「内容 + 纯命令」时给出内容',
+          (cs.trim_trailing_command_blocks(
+              '```python\nX = 1\n```\n说明\n```powershell\nGet-Date\n```\n')
+           or '').strip() == 'X = 1')
+
     PS = [{'name': 'PowerShell'}]
     check('★ PowerShell 缺 command 要触发重试',
           cs.incomplete_tool([{'name': 'PowerShell', 'input': {}}]) is not None)

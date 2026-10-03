@@ -783,6 +783,12 @@ _CONTENT_BLOCK_TAGS = {'python', 'py', 'python3', 'text', 'txt', 'plaintext',
                        'rust', 'rb', 'php', 'vue', 'dockerfile'}
 
 
+# 文档类的块：它们里面出现围栏是**正常内容**，不能拿 trim 去切。
+# （见 trim_trailing_command_blocks）
+_MARKUP_BLOCK_TAGS = {'markdown', 'md', 'text', 'txt', 'plaintext', 'rst',
+                      'adoc', 'asciidoc'}
+
+
 def _block_kind(match):
     """这一块是 'command' / 'content' / None（认不出）。"""
     tag = match.group(0).split('\n', 1)[0].lstrip('`').strip().lower()
@@ -828,6 +834,71 @@ def pair_blocks_by_kind(region, need):
         else:
             return None                      # 有一个配不上 → 整体不动手
     return assign
+
+
+def trim_trailing_command_blocks(region):
+    """
+    单个内容块后面又跟了**清一色命令块**时，切掉后面那截，返回内容；否则 None。
+
+    ★ 为什么需要它（第十八轮补四，实测**每次长任务都中**）：
+      模型写完文件正文后，习惯性地再贴一个「下一步要跑的命令」的代码块——
+
+          ```python
+          <文件正文>
+          ```
+          文件写好了，接下来跑一下确认：
+          ```powershell
+          cd ...; py -3.11 big.py 2>&1; Write-Output "EXIT=$LASTEXITCODE"
+          ```
+
+      上面那些代码块由**贪婪**正则（有意为之，见 _CODE_BLOCK_RE 的说明）一口吃下，
+      于是**命令被当成了文件内容的一部分**。日志里的实证（尾 80 字）：
+
+          [警告] 附上去的内容里还带围栏。长度 9127，
+                 尾 '...run1\shim; py -3.11 big.py 2>&1; Write-Output "EXIT=$LASTEXITCODE"\n'
+
+      ——4 轮长任务里触发了 **6 次**，每次都让模型多花好几轮去发现和清理
+      （它自己的叙述：「第 273 行往后混进了围栏和 JSON，是写入时多带的尾巴」）。
+
+    ★ 判据为什么敢下刀（而不是像之前那样只记不裁）：
+      用**非贪婪**切一遍，看得见块边界。只有当
+          第一块是**内容**块，且**后面每一块都是命令**块
+      时才切。这个条件排掉了「内容自带围栏」那种情况 ——
+      那时非贪婪会把一段内容切成好几块，后面那些块是**内容**（或认不出），
+      不满足「清一色命令」，于是原样返回 None、走老路。
+      （实测：写一个「里面同时有 python 和 powershell 示例」的 .md 就是这种，
+        它会落到 None 分支，一个字符都不动。）
+
+    ★ 仍然只是「多一层保护」：切不了就返回 None，绝不猜。
+    """
+    blocks = list(_CODE_BLOCK_RE_NG.finditer(region))
+    if len(blocks) < 2:
+        return None
+
+    def tag(m):
+        return m.group(0).split('\n', 1)[0].lstrip('`').strip().lower()
+
+    kinds = [_block_kind(m) for m in blocks]
+    if kinds[0] != 'content':
+        return None                       # 第一块得**明确**是内容，不然不动手
+    # ★ 第一块还得是**代码类**（python / js / sql…），不能是 markdown / text。
+    #   理由：这项修复针对的是「写代码文件时尾巴多挂了一条命令」，
+    #   而**文档类**文件里出现围栏是正常内容（写说明、写带示例的 README）。
+    #   把 markdown/text 排除掉，就排掉了最可能被误裁的那一类。
+    if tag(blocks[0]) in _MARKUP_BLOCK_TAGS:
+        return None
+    # ★ 后面每一块要么明确是命令，要么**没有语言标记**。
+    #
+    #   为什么允许「没标记」：实测模型经常把那条尾巴写成**裸围栏**——
+    #       ```
+    #       py -3.11 big.py; Write-Output "EXIT=$LASTEXITCODE"
+    #       ```
+    #   第一版要求「清一色 command」，于是**一次都没生效**（日志里全是
+    #   「切不了」）。但「后面还有**内容**块」仍然必须排除 —— 那才是
+    #   「内容自带围栏被切坏了」的形状。
+    if not all(k in ('command', None) for k in kinds[1:]):
+        return None
+    return blocks[0].group(1)
 
 
 def block_pairing_failed(region, tools):
@@ -901,7 +972,28 @@ def _attach_code_block(text, tools):
         m = _CODE_BLOCK_RE.search(region)
         if not m:
             return tools
-        fill = {need[0][0]: m.group(1)}
+        body = m.group(1)
+        # ★ 「贪婪」是有意的（内容自带围栏时才不会截断），但它的代价是
+        #   **可能把后面的东西也吃进来**：模型写完正文爱再贴一个
+        #   「下一步要跑的命令」的代码块，于是**命令被当成了文件内容**。
+        #   实测 4 轮长任务里中了 6 次（见 trim_trailing_command_blocks）。
+        #
+        #   ★ 只在判据**明确**时才切（第一块是内容块 + 后面清一色命令块）；
+        #     判不了就一个字符都不动 —— 裁错是静默截断，比不裁严重得多。
+        if need[0][1] != 'command':
+            trimmed = trim_trailing_command_blocks(region)
+            if trimmed is not None and len(trimmed) < len(body):
+                ds.log('[提示] 内容后面还跟着命令块 —— 已切掉，'
+                       '免得命令被写进文件（%d 字 → %d 字）'
+                       % (len(body), len(trimmed)))
+                body = trimmed
+            elif '```' in body:
+                # 切不了（可能是内容自带围栏）→ 只记不改。
+                # 记下来才有得统计：这个分支该不该有、有多少。
+                ds.log('[警告] 内容里带围栏且切不了（可能是自带围栏，'
+                       '也可能是尾巴垃圾）。长度 %d，尾 80 字：%r'
+                       % (len(body), body[-80:]))
+        fill = {need[0][0]: body}
     else:
         blocks = list(_CODE_BLOCK_RE_NG.finditer(region))
         bodies = [m.group(1) for m in blocks]
@@ -980,37 +1072,48 @@ def _remove_tool_call_span(text):
         · 拦 → 白重试一轮（实测 e2e 就是这么红的）
       切开之后，贪婪正则只在自己那一块里贪婪，两个问题一起没了。
     """
-    start, end = _find_tool_call_span(text)
-    if start < 0:
-        # 抠不出完整的一段 —— 多半是 JSON 被截断了。交给重试路径处理，别乱切。
-        return text
-
-    # ★ 只有「工具调用确实被围栏包着」时才需要切。判据是**围栏数量的奇偶**：
-    #
-    #     我这就写。          ← 1 个围栏（奇数）→ 最后那个是「还没闭合的开头」
-    #     ```json                → JSON 被包着，必须切
-    #     {"tool_use": ...}
-    #
-    #     我这就写。          ← 2 个围栏（偶数）→ 最后那个只是**收尾**
-    #     ```python              → JSON 没被包，后面/前面那个围栏是内容自己的
-    #     <内容>                   一个字符都不能动，动了内容就丢
-    #     ```
-    #     {"tool_use": ...}
-    #
-    #   ★ 光看「紧邻的是不是 ```」分不出来 —— 包 JSON 的开头围栏和前一个
-    #     内容块的收尾围栏**长得一模一样**。我第一版就是这么写错的，
-    #     后果是**把已经拿到手的内容整段切掉**（静默丢数据，最危险的一类）。
-    head_text = text[:start]
-    if head_text.count('```') % 2 == 0:
-        return text
-    fm = _FENCE_OPEN_BEFORE_RE.search(head_text)
-    if not fm:
-        return text
-
-    # 括号配对交给 _find_tool_call_span 了 —— end 已经是那段 JSON 的结尾
-    head = text[:fm.start()]
-    tail = _FENCE_CLOSE_AFTER_RE.sub('', text[end:], count=1)
-    return head + tail
+    # ★ 第十八轮补四：**一段回复里可能有好几个工具调用**，而这里原来只切
+    #   第一个。剩下那些留在文本里，会被贪婪的代码块正则当成「内容」圈进去
+    #   —— 实测长任务的现场（模型自己的叙述）：
+    #       「第 273 行往后混进了我上一条消息里的 markdown 围栏和 JSON，
+    #         是写入时多带的尾巴」
+    #       「正文到第 367 行结束，368 行往后都是围栏和 JSON 垃圾」
+    #   于是模型写完文件要再花好几轮把垃圾抠掉（那一轮 16 轮 vs 对方 3 轮）。
+    #   切干净是**没有争议**的：JSON 本来就不该出现在内容里。
+    out = text
+    for _ in range(8):                     # 上限防死循环，实际极少超过 2 个
+        start, end = _find_tool_call_span(out)
+        if start < 0:
+            break
+        # ★ 只有「工具调用确实被围栏包着」时才连围栏一起切。判据是**围栏数量的奇偶**：
+        #
+        #     我这就写。          ← 1 个围栏（奇数）→ 最后那个是「还没闭合的开头」
+        #     ```json                → JSON 被包着，必须切
+        #     {"tool_use": ...}
+        #
+        #     我这就写。          ← 2 个围栏（偶数）→ 最后那个只是**收尾**
+        #     ```python              → JSON 没被包，后面/前面那个围栏是内容自己的
+        #     <内容>                   一个字符都不能动，动了内容就丢
+        #     ```
+        #     {"tool_use": ...}
+        #
+        #   ★ 光看「紧邻的是不是 ```」分不出来 —— 包 JSON 的开头围栏和前一个
+        #     内容块的收尾围栏**长得一模一样**。我第一版就是这么写错的，
+        #     后果是**把已经拿到手的内容整段切掉**（静默丢数据，最危险的一类）。
+        head_text = out[:start]
+        if head_text.count('```') % 2 == 0:
+            # JSON 没被围栏包着 —— 只把那一段 JSON 本身删掉，前后一个字不动
+            out = out[:start] + out[end:]
+            continue
+        fm = _FENCE_OPEN_BEFORE_RE.search(head_text)
+        if not fm:
+            out = out[:start] + out[end:]
+            continue
+        # 括号配对交给 _find_tool_call_span 了 —— end 已经是那段 JSON 的结尾
+        head = out[:fm.start()]
+        tail = _FENCE_CLOSE_AFTER_RE.sub('', out[end:], count=1)
+        out = head + tail
+    return out
 
 
 def _looks_like_call(obj):

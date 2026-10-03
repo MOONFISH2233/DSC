@@ -46,14 +46,97 @@ from e2e_check import (SYS, TOOLS, task_text, run_tool, shim_up, start_shim,
 TMP_DIR = os.path.join(HERE, '_ab_tmp')
 SHIM_PORT = 8798                 # 和 e2e 一样避开 8799
 
-# 小任务：够短，能看出「谁更利索」，又不至于烧掉太多 token。
-SHORT_TASK = (
-    '请写一个 Python 脚本到 %s。\n'
-    '脚本功能：读一个文本文件，统计每个词出现的次数，输出前 10 名。\n'
-    '要有函数拆分、有 __main__ 入口、有错误处理。写完**运行它**验证能跑通，'
-    '再告诉我文件路径。\n'
-    '自己造一个测试用的文本文件，别去读别的路径。'
-)
+# ────────────────────────── 任务库 ──────────────────────────
+#
+# ★ 每个任务**压的是不同的那条路**，不是随便换几个题。选任务的依据是
+#   「它会不会经过 shim 里某个分支」，而不是「它难不难」：
+#
+#     short  一轮写多个文件 + 跑命令   → 多块配对（_attach_code_block）
+#     edit   先读一个已有文件再改它    → Edit 的 new_string 走代码块
+#                                       （这条**从来没被端到端跑过**）
+#     cmd    主要产出是几条命令        → command 字段走代码块
+#     long   写 300 行以上的文件       → 网页截断 / 续写 / 重试
+#     multi  一次建三个文件再串起来    → 多调用 + 多文件 + 跨轮引用
+#
+# ★ 任务里的 %(w)s 是**每侧各自的工作目录**（两侧绝不能共用目录，
+#   否则先跑的那侧留下的产物会改变后跑那侧的起点 —— e2e 踩过这个坑）。
+
+def _t_short(w):
+    return ('请写一个 Python 脚本到 %(w)s\\wordcount.py。\n'
+            '脚本功能：读一个文本文件，统计每个词出现的次数，输出前 10 名。\n'
+            '要有函数拆分、有 __main__ 入口、有错误处理。\n'
+            '同时造一个测试用的文本文件 %(w)s\\sample.txt（内容你自己编）。\n'
+            '写完**运行它**验证能跑通，再告诉我文件路径。' % {'w': w})
+
+
+def _t_edit(w):
+    return ('工作目录 %(w)s 里有一个 report.py（已经建好了）。\n'
+            '请**先读它**，然后做三处修改：\n'
+            '1) 把 top_words 函数改成**返回**列表，不要在函数里直接打印\n'
+            '2) 给命令行加上 --top N 参数（默认 10）\n'
+            '3) 给每个函数补一句 docstring\n'
+            '**用 Edit 工具改，不要整个重写文件**。改完运行一次确认没问题。'
+            % {'w': w})
+
+
+def _t_cmd(w):
+    return ('请在 %(w)s 目录下用 PowerShell 依次做这几件事，每步跑完看一眼结果：\n'
+            '1) 建一个子目录 logs\n'
+            '2) 在 logs 里生成 data.txt，50 行，每行是「行号,当前时间」\n'
+            '3) 统计 data.txt 的行数和字节数\n'
+            '4) 把 data.txt 按行号倒序输出前 5 行\n'
+            '全部用真正的 PowerShell 语法，最后把 3) 4) 的结果告诉我。' % {'w': w})
+
+
+def _t_long(w):
+    return ('请写一个 Python 脚本到 %(w)s\\big.py。\n'
+            '脚本里要有 **30 个函数**，每个函数带 docstring 和一行中文注释，'
+            '每个函数做一件小事（加减乘除、字符串处理、列表操作等各来几个）。\n'
+            '文件长度要在 **300 行以上**，写完运行 `py -3.11 big.py` 确认没有语法错。'
+            % {'w': w})
+
+
+def _t_multi(w):
+    return ('请在 %(w)s 里建三个文件：a.py、b.py、c.py，'
+            '每个文件里定义一个同名函数（afunc / bfunc / cfunc），各返回一个字符串。\n'
+            '再建第四个文件 main.py，import 那三个模块并调用它们、把结果打印出来。\n'
+            '最后运行 main.py 确认输出正常。' % {'w': w})
+
+
+def _seed_edit(w):
+    """edit 任务需要一个**已经存在**的文件 —— 由我们建好，不是让模型建。"""
+    open(os.path.join(w, 'report.py'), 'w', encoding='utf-8').write(
+        '# -*- coding: utf-8 -*-\n'
+        '"""词频统计。"""\n'
+        'import sys\n'
+        '\n'
+        'def top_words(path, n):\n'
+        '    counts = {}\n'
+        '    for line in open(path, encoding="utf-8"):\n'
+        '        for w in line.split():\n'
+        '            counts[w] = counts.get(w, 0) + 1\n'
+        '    ranked = sorted(counts.items(), key=lambda kv: -kv[1])\n'
+        '    for w, c in ranked[:n]:\n'
+        '        print(w, c)\n'
+        '\n'
+        'def main():\n'
+        '    if len(sys.argv) < 2:\n'
+        '        print("用法: report.py <文件>")\n'
+        '        return 1\n'
+        '    top_words(sys.argv[1], 10)\n'
+        '    return 0\n'
+        '\n'
+        'if __name__ == "__main__":\n'
+        '    sys.exit(main())\n')
+
+
+TASKS = {
+    'short': {'text': _t_short, 'setup': None},
+    'edit': {'text': _t_edit, 'setup': _seed_edit},
+    'cmd': {'text': _t_cmd, 'setup': None},
+    'long': {'text': _t_long, 'setup': None},
+    'multi': {'text': _t_multi, 'setup': None},
+}
 
 
 def api_endpoint():
@@ -96,7 +179,10 @@ def run_side(label, url, headers, model, task, workdir, max_rounds=25):
     """跑一侧，返回过程记录。两边用的是同一段循环，所以差异只来自后端。"""
     shutil.rmtree(workdir, ignore_errors=True)
     os.makedirs(workdir, exist_ok=True)
-    outfile = os.path.join(workdir, 'gen_report.py')
+    # ★ 有些任务需要一个**已经存在**的文件（比如「读它然后改它」）。
+    #   由我们建好，不是让模型建 —— 否则测的就不是「改文件」那条路了。
+    if task.get('setup'):
+        task['setup'](workdir)
 
     sid = 'ab-%s-%d' % (label, int(time.time()))
     body_common = {
@@ -107,10 +193,10 @@ def run_side(label, url, headers, model, task, workdir, max_rounds=25):
         'metadata': {'user_id': json.dumps({'session_id': sid})},
     }
 
-    msgs = [{'role': 'user', 'content': task % outfile.replace('\\', '\\\\')}]
+    msgs = [{'role': 'user', 'content': task['text'](workdir)}]
     rec = {'label': label, 'rounds': 0, 'tools': [], 'elapsed': 0.0,
            'leaked': 0, 'narrated': 0, 'usage_in': 0, 'usage_out': 0,
-           'errors': [], 'texts': [], 'final': '', 'outfile': outfile,
+           'errors': [], 'texts': [], 'final': '', 'workdir': workdir,
            # ★ 工具**结果**报错的次数 —— 「模型跑的命令失败了几次」。
            #   这是除轮数之外最能说明「谁更靠谱」的量：原生 API 那边几乎
            #   不该有，dsc 这边每失败一次就多烧一轮。
@@ -169,8 +255,14 @@ def run_side(label, url, headers, model, task, workdir, max_rounds=25):
         msgs.append({'role': 'user', 'content': results})
 
     rec['elapsed'] = time.time() - t0
-    rec['artifact'] = (os.path.getsize(outfile)
-                       if os.path.exists(outfile) else 0)
+    # 「产物」不写死某个文件名 —— 任务库里每个任务产出的文件都不一样。
+    # 记 .py 总字节（粗粒度的工作量）+ 文件清单（细看用）。
+    try:
+        rec['files'] = sorted(f for f in os.listdir(workdir))
+        rec['artifact'] = sum(os.path.getsize(os.path.join(workdir, f))
+                              for f in rec['files'] if f.endswith('.py'))
+    except OSError:
+        rec['files'], rec['artifact'] = [], 0
     with open(os.path.join(workdir, 'transcript.txt'), 'w',
               encoding='utf-8') as f:
         for i, t in enumerate(rec['texts'], 1):
@@ -300,31 +392,53 @@ def summarize(pairs):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('--side', choices=['both', 'shim', 'api'], default='both')
-    ap.add_argument('--task', choices=['full', 'short'], default='short',
-                    help='short 省 token（默认）；full 是 e2e 那道长任务')
+    ap.add_argument('--task', default='short',
+                    help='short/edit/cmd/long/multi，或者 all（每轮把任务库走一遍）'
+                         '；full 是 e2e 那道长任务')
     ap.add_argument('--rounds', type=int, default=25)
     ap.add_argument('--repeat', type=int, default=1,
                     help='跑几轮对拍（≥3 才谈得上「系统性差距」）')
+    # ★ 轮间必须歇一下（第十八轮补四，实测教训）：连着跑 25 轮之后，
+    #   DeepSeek 网页版开始回「服务器繁忙」，随后自测里四条联网用例全红
+    #   （「回答没有开始」「三种发送方式都没能把消息发出去」）——
+    #   **看起来像我们把代码改坏了，其实是限流**。
+    #   冷 3 分钟之后同样的用例 36/0 全绿。
+    #   宁可跑慢点，也不要跑出一屏假红。
+    ap.add_argument('--cooldown', type=int, default=15,
+                    help='每轮之间歇多少秒（防限流；撞上「服务器繁忙」会自动 '
+                         '按 4 倍歇）')
     ap.add_argument('--save', action='store_true',
-                    help='保留产物（默认每轮开跑前清空，免得上一轮的成品'
-                         '改变这一轮的起点 —— e2e 踩过这个坑）')
+                    help='保留**每一轮**的产物（默认只留最近一轮）')
     args = ap.parse_args()
 
-    task = SHORT_TASK if args.task == 'short' else task_text('%s')
-    if args.task == 'full':
-        # task_text 里已经把路径写死了，这里改成占位符好让两侧各写各的目录
-        task = task.replace(os.path.join(HERE, '_e2e_tmp', 'gen_report.py'), '%s')
+    # ── 排计划：每轮把任务库走一遍（--task all），或者重复同一个任务 ──
+    if args.task == 'all':
+        names = list(TASKS)
+    elif args.task == 'full':
+        names = ['full']
+    elif args.task in TASKS:
+        names = [args.task]
+    else:
+        print('❌ 不认识的任务 %r，可选：%s' % (args.task, '、'.join(TASKS)))
+        return 2
+    plan = [nm for _ in range(args.repeat) for nm in names]
+
+    def task_of(name):
+        if name == 'full':
+            # e2e 那道长任务 —— task_text 里路径写死了，改成占位符
+            t = task_text('%s').replace(
+                os.path.join(HERE, '_e2e_tmp', 'gen_report.py'), '%s')
+            return {'text': lambda w: t % w, 'setup': None}
+        return TASKS[name]
 
     print('=' * 78)
-    print('  A/B 对拍 · 任务=%s · %d 轮' % (args.task, args.repeat))
+    print('  A/B 对拍 · %d 轮 · 任务序列：%s'
+          % (len(plan), ' → '.join(plan)))
     print('=' * 78)
 
-    shim_used_8799 = shim_up('http://127.0.0.1:8799')
-    if shim_used_8799 and args.side in ('both', 'shim'):
-        print('\n⚠️  8799 上有一个 shim 在跑（可能是你的 dsc 会话）。')
-        print('    对拍会用自己那个（%d），但**浏览器只有一个** ——' % SHIM_PORT)
-        print('    你那边一有请求，两边就会互相把页面导航走。')
-        print('    建议先确认没有别的 dsc 会话在跑。\n')
+    if shim_up('http://127.0.0.1:8799') and args.side in ('both', 'shim'):
+        print('\n⚠️  8799 上有一个 shim 在跑（可能是你的 dsc 会话）——')
+        print('    浏览器只有一个，两边会互相把页面导航走。\n')
 
     ep = None
     if args.side in ('both', 'api'):
@@ -335,60 +449,96 @@ def main():
             return 2
         print('  B 侧: %s  model=%s' % (ep['base'], ep['model']))
 
+    # ★ 每一轮的结果**追加**到 summary.tsv —— 跑几个小时的话，
+    #   控制台日志会很长，事后要靠这个文件统计（而且中途断了也不丢）。
+    os.makedirs(TMP_DIR, exist_ok=True)
+    tsv = os.path.join(TMP_DIR, 'summary.tsv')
+    if not os.path.exists(tsv):
+        with open(tsv, 'w', encoding='utf-8') as f:
+            f.write('seq\ttask\tside\trounds\ttools\telapsed\ttool_errors\t'
+                    'patch\tleaked\tartifact\terrors\n')
+
+    def record(seq, taskname, rec):
+        patch = (rec.get('retries', 0) + rec.get('no_content', 0)
+                 + rec.get('continues', 0) + rec.get('busy', 0))
+        with open(tsv, 'a', encoding='utf-8') as f:
+            f.write('%d\t%s\t%s\t%d\t%d\t%.0f\t%d\t%d\t%d\t%d\t%d\n'
+                    % (seq, taskname, rec['label'], rec['rounds'],
+                       sum(len(x) for x in rec['tools']), rec['elapsed'],
+                       rec['tool_errors'], patch, rec['leaked'],
+                       rec['artifact'], len(rec['errors'])))
+        print('  ★ 记录 %s/%s：轮 %d · 工具 %d · %.0fs · 报错 %d · '
+              '补丁 %d · 产物 %d 字'
+              % (taskname, rec['label'], rec['rounds'],
+                 sum(len(x) for x in rec['tools']), rec['elapsed'],
+                 rec['tool_errors'], patch, rec['artifact']))
+
     pairs = []
     proc = None
     try:
-        for i in range(1, args.repeat + 1):
+        for seq, name in enumerate(plan, 1):
             print('\n' + '━' * 78)
-            print('  第 %d/%d 轮对拍' % (i, args.repeat))
+            print('  第 %d/%d 轮 · 任务 %s' % (seq, len(plan), name))
             print('━' * 78)
-            run_dir = os.path.join(TMP_DIR, 'run%d' % i)
-            if not args.save and i > 1:
-                shutil.rmtree(run_dir, ignore_errors=True)
+            run_dir = os.path.join(TMP_DIR, 'run%d' % seq)
+            if not args.save:
+                # 只留最近一轮的产物，不然几小时下来会堆满磁盘
+                for old in os.listdir(TMP_DIR):
+                    if old.startswith('run') and old != 'run%d' % seq:
+                        shutil.rmtree(os.path.join(TMP_DIR, old),
+                                      ignore_errors=True)
             a = b = None
+            task = task_of(name)
 
-            if args.side in ('both', 'shim'):
-                # ★ 每轮都要重起 shim 吗？不用 —— 但**必须让它用干净的
-                #   目录**，而且不能复用上一轮的会话映射（那会让第二轮
-                #   变成「接着上一轮聊」，任务就不是同一个起点了）。
-                #   所以每轮换个新的 session_id，映射自然就分开了。
-                print('[A] dsc（网页版 + 协议模拟）')
-                if proc is None:
-                    # ★ 传自己的目录：start_shim 默认往 e2e_check 的 _e2e_tmp
-                    #   写，而那边不归我们管、也不保证存在（第一版就是这么炸的）。
-                    proc, url, ownlog = start_shim(
-                        SHIM_PORT, os.path.join(run_dir, 'shim'))
-                # ★ shim 只起一次、连着跑多轮，所以它的 stderr 是**累积**的 ——
-                #   必须只数这一轮新增的那一段，否则第 2 轮会把第 1 轮的重试
-                #   再数一遍（数出来的是 1、2、3… 的累加，看着像越来越糟）。
-                #   e2e 那边也踩过同类坑（读公共日志会把用户的会话算进来）。
-                _before = read_own_log(ownlog)
-                a = run_side('dsc', url, {'content-type': 'application/json'},
-                             'deepseek-web', task,
-                             os.path.join(run_dir, 'shim'), args.rounds)
-                _log = read_own_log(ownlog)[len(_before):]
-                a['retries'] = len(re.findall(r'\[重试\].*重新问一次', _log))
-                a['no_content'] = len(re.findall(r'缺 content', _log))
-                a['continues'] = len(re.findall(r'\[续写\].*点「继续生成」', _log))
-                a['busy'] = len(re.findall(r'\[繁忙\]', _log))
+            # ★ 单轮出错**不能中断整场** —— 要跑几小时，中间撞上一次
+            #   网页超时/服务器繁忙是常态。出错就跳过这一轮，接着下一轮，
+            #   但要把错误记下来（最后统计时能看出「哪类任务容易崩」）。
+            try:
+                if args.side in ('both', 'shim'):
+                    print('[A] dsc（网页版 + 协议模拟）')
+                    if proc is None:
+                        proc, url, ownlog = start_shim(
+                            SHIM_PORT, os.path.join(TMP_DIR, 'run%d' % seq, 'shim'))
+                    # ★ shim 只起一次、连着跑很多轮，它的 stderr 是**累积**的 ——
+                    #   必须只数这一轮新增的那一段，否则第 2 轮会把第 1 轮的重试
+                    #   再数一遍（数出来的是累加，看着像越来越糟）。
+                    _before = read_own_log(ownlog)
+                    a = run_side('dsc', url, {'content-type': 'application/json'},
+                                 'deepseek-web', task,
+                                 os.path.join(run_dir, 'shim'), args.rounds)
+                    _log = read_own_log(ownlog)[len(_before):]
+                    a['retries'] = len(re.findall(r'\[重试\].*重新问一次', _log))
+                    a['no_content'] = len(re.findall(r'缺 content', _log))
+                    a['continues'] = len(re.findall(r'\[续写\].*点「继续生成」', _log))
+                    a['busy'] = len(re.findall(r'\[繁忙\]', _log))
+                    record(seq, name, a)
 
-            if args.side in ('both', 'api'):
-                print('\n[B] 真实 API（原生工具调用）')
-                # ★ 只传 base —— run_side 自己会接 '/v1/messages'。
-                #   第一版在这儿又接了一次，拼成 .../v1/messages/v1/messages，
-                #   于是 404 cave_route_not_found（还先去查了一轮请求头，白查）。
-                b = run_side('api', ep['base'], ep['headers'], ep['model'],
-                             task, os.path.join(run_dir, 'api'), args.rounds)
-
+                if args.side in ('both', 'api'):
+                    print('\n[B] 真实 API（原生工具调用）')
+                    b = run_side('api', ep['base'], ep['headers'], ep['model'],
+                                 task, os.path.join(run_dir, 'api'), args.rounds)
+                    record(seq, name, b)
+            except Exception as e:
+                print('  ❌ 第 %d 轮整体失败，跳过：%s' % (seq, str(e)[:160]))
             if a and b:
                 pairs.append((a, b))
-                show(a, b)
+
+            # ★ 轮间歇一下。撞上「服务器繁忙」就按 4 倍歇 ——
+            #   继续猛打只会让后面每一轮都红，把时间浪费在假故障上。
+            if seq < len(plan):
+                busy = (a or {}).get('busy', 0)
+                nap = args.cooldown * (4 if busy else 1)
+                if busy:
+                    print('  ⏸️  这一轮撞了 %d 次「服务器繁忙」，歇 %d 秒再继续'
+                          % (busy, nap))
+                time.sleep(nap)
     finally:
         if proc:
             proc.kill()
 
     if len(pairs) > 1:
         summarize(pairs)
+    print('\n  明细在 %s' % tsv)
     return 0
 
 

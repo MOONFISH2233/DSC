@@ -70,6 +70,16 @@ TOOLS = [
     {'name': 'PowerShell', 'description': '执行一条 PowerShell 命令',
      'input_schema': {'type': 'object', 'properties': {
          'command': {'type': 'string'}}, 'required': ['command']}},
+    # ★ Edit 是**必须有的**（第十八轮补三加的）：`_BLOCK_FIELD` 里有
+    #   `'Edit': 'new_string'` —— 也就是说 Edit 的正文也走「代码块补给字段」
+    #   那条路，而它在此之前**从来没被端到端跑过**（Write 和 PowerShell 都有
+    #   任务覆盖，Edit 一个都没有）。改文件的活恰恰是 dsc 用得最多的一类。
+    {'name': 'Edit', 'description': '把文件里的一段文本替换成另一段（改文件用这个）',
+     'input_schema': {'type': 'object', 'properties': {
+         'file_path': {'type': 'string'},
+         'old_string': {'type': 'string'},
+         'new_string': {'type': 'string'}},
+         'required': ['file_path', 'old_string', 'new_string']}},
 ]
 
 
@@ -163,10 +173,52 @@ def run_tool(name, inp):
                         errors='replace').read()[:4000], False
         except Exception as e:
             return '读失败: %s' % e, True
+    if name == 'Edit':
+        p = inp.get('file_path') or ''
+        old, new = inp.get('old_string'), inp.get('new_string')
+        # ★ new_string 缺了要**明确报错**，不能当成空串去替换 ——
+        #   那会把文件里那一段**静默删掉**，而且看起来像成功了。
+        if new is None:
+            return '错误：new_string 是空的，文件没改（多半是被长度上限截断了）', True
+        try:
+            src = open(p, encoding='utf-8', errors='replace').read()
+        except Exception as e:
+            return '读不了 %s: %s' % (p, e), True
+        if not old:
+            return '错误：old_string 是空的，不猜你要改哪儿', True
+        if old not in src:
+            return 'old_string 在文件里找不到（要原样复制，包括缩进）', True
+        with open(p, 'w', encoding='utf-8') as f:
+            f.write(src.replace(old, new, 1))
+        return '已改 %s（替换 %d 字 → %d 字）' % (p, len(old), len(new)), False
     if name == 'PowerShell':
         try:
+            # ★ PowerShell 的**编码**必须显式摆平（第十八轮补四）。
+            #
+            #   中文 Windows 上 PowerShell 5.1 默认按 GBK 读写文件，于是模型
+            #   最常用的 `Get-Content` / `Set-Content` 会把 UTF-8 的中文**毁掉**
+            #   ——而且是**改坏文件本身**，不只是显示乱码：实测
+            #       Get-Content t.txt; Set-Content t.txt (Get-Content t.txt)
+            #   跑完文件里的 `中文` 变成 `\xe6\x96?`（那个 `?` 是 0x3F，真的写进去了）。
+            #
+            #   后果：模型看到乱码 → 去修「编码问题」→ 越修越乱，实测长任务
+            #   那一轮它自己叙述：「中文在 Set-Content 里被搞成乱码了」、
+            #   「改用 .NET 的 UTF-8 读写」——**十几轮里有好几轮花在这上面**。
+            #
+            #   ★ 这是**两边共用**的执行环境，所以它不是「偏袒谁」，而是
+            #     **噪声**：它测的是「模型能不能从 GBK 损坏里爬出来」，
+            #     而不是我们想测的「协议层有没有问题」。摆平它，量到的才是
+            #     协议层的差别。
+            #   （真实 Claude Code 在 Windows 上也做了这类编码处理。）
+            setup = ('$OutputEncoding=[Text.Encoding]::UTF8;'
+                     '[Console]::OutputEncoding=[Text.Encoding]::UTF8;'
+                     "$PSDefaultParameterValues['Get-Content:Encoding']='utf8';"
+                     "$PSDefaultParameterValues['Set-Content:Encoding']='utf8';"
+                     "$PSDefaultParameterValues['Out-File:Encoding']='utf8';"
+                     "$PSDefaultParameterValues['Add-Content:Encoding']='utf8';")
             r = subprocess.run(
-                ['powershell', '-NoProfile', '-Command', inp.get('command') or ''],
+                ['powershell', '-NoProfile', '-Command',
+                 setup + (inp.get('command') or '')],
                 capture_output=True, text=True, timeout=180,
                 encoding='utf-8', errors='replace')
             return (r.stdout or '') + (r.stderr or ''), r.returncode != 0
