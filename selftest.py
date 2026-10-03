@@ -1202,6 +1202,51 @@ def test_unit():
          dsc.click_continue, dsc.STABLE_NORMAL, dsc.POLL, dsc.MAX_CONTINUES,
          dsc.CONTINUE_WAIT, dsc.CONTINUE_CLICK_TRIES) = _saved_c
 
+    section('单元 · 回答内容一字不差时也要认得出（缺陷 58）')
+    # ★★ 第十八轮补五：**同一句话问两遍、模型答得一字不差**时，
+    #   「回答开始了没有」原来只比内容（`txt != baseline`）—— 新回答的文本
+    #   **等于** baseline，于是永远不成立，干等满 90 秒报「回答没有开始」。
+    #
+    #   实测（_same_answer_probe.py）：连问四遍「只回答两个字：收到」，
+    #   页面上**确实有四条一模一样的「收到」**，后三次全被判成「没开始」。
+    #   而自测自己就踩中过：`普通对话正常` 和 `正常回答能拿到结果` 用的是
+    #   同一句话，第二条必然中招 —— 当时被我误判成「限流」。
+    _saved3 = (dsc.last_answer_text, dsc.answers, dsc.STABLE_NORMAL, dsc.POLL)
+    st3 = {'n': 1, 'text': '收到'}
+    try:
+        dsc.last_answer_text = lambda _p: st3['text']
+        # 文本永远是 '收到'（和 baseline 相同），但回答节点多了一条
+        dsc.answers = lambda _p: [object()] * st3['n']
+        dsc.STABLE_NORMAL = 0.15
+        dsc.POLL = 0.05
+
+        # ① 节点数变多 → 必须认出来（这条就是缺陷 58 的现场）
+        st3.update(n=2, text='收到')
+        t0 = time.time()
+        txt, err = dsc.wait_answer(object(), '收到', False,
+                                   start_limit=2.0, total_limit=5.0, baseline_n=1)
+        dt = time.time() - t0
+        check('★ 内容与上一条相同时，靠「回答节点变多」认出新回答',
+              err is None and txt == '收到',
+              f'err={err!r} txt={txt!r} 耗时 {dt:.1f} 秒')
+        check('★ 而且不能干等到超时（90 秒那种）', dt < 3.0, f'耗时 {dt:.1f} 秒')
+
+        # ② 节点数没变、内容也没变 → 仍然该报「没开始」（别把失败判成成功）
+        st3.update(n=1, text='收到')
+        txt2, err2 = dsc.wait_answer(object(), '收到', False,
+                                     start_limit=1.0, total_limit=2.0, baseline_n=1)
+        check('节点数和内容都没变时，仍然报「回答没有开始」',
+              err2 is not None and txt2 is None, f'err={err2!r}')
+
+        # ③ 不传 baseline_n（老调用点）→ 行为不变，还是靠内容
+        st3.update(n=5, text='收到')
+        txt3, err3 = dsc.wait_answer(object(), '收到', False,
+                                     start_limit=1.0, total_limit=2.0)
+        check('不传 baseline_n 时行为不变（向后兼容）',
+              err3 is not None, f'err={err3!r}')
+    finally:
+        (dsc.last_answer_text, dsc.answers, dsc.STABLE_NORMAL, dsc.POLL) = _saved3
+
     section('单元 · 服务器繁忙不能当回答')
     # ★ 回归：服务端限流时页面弹「服务器繁忙，请稍后重试」，这一轮**根本没生成出
     #   回答**，回答气泡里只剩 `{"` 两个字。它被当成「正经回答」交给上游后，

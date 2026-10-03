@@ -73,6 +73,13 @@ POLL_FAST = POLL                  # 开头的密查
 POLL_SLOW = 0.5                   # 之后的稀查
 POLL_FAST_WINDOW = 3.0            # 开头多久用密查（秒）
 
+# 「发出去了没有」的轮询间隔（第十八轮补五）。
+#
+# ★ 比 POLL_FAST 还密：它等的是一个**本地事件**（React 提交后清空输入框），
+#   不像等模型生成那样可能几秒没动静。实测 0.1~0.3 秒内就成立。
+#   预算仍是原来的 1.5 秒，只是不再死等满。
+SEND_POLL = 0.12
+
 # 「继续生成」按钮的最小扫描间隔。
 #
 # ★ 为什么降频：按钮一旦出现就不会瞬间消失，1 秒粒度足够。
@@ -1065,12 +1072,21 @@ def send_question(page, text, baseline='', attachments=None):
         raise RuntimeError('找不到输入框。可能没登录 —— 先跑 ask.cmd --login')
 
     box.click()
+    # ★ 框里本来就是空的就**别清了**（第十八轮补五提速）。
+    #   清一次要走两次真实按键（ctrl-a + del，见下面 clear 的说明），
+    #   而读一次 value 只要一个 CDP 往返。实测绝大多数轮次框都是空的 ——
+    #   这一处是热路径，省下的是**每一轮**。
     try:
-        # by_js=False 走真实按键（ctrl-a + del）。by_js=True 直接改 value
-        # 不会触发 React 的 onChange，框里看着有字但发出去是空的。
-        box.clear(by_js=False)
+        _cur = box.run_js('return this.value') or ''
     except Exception:
-        pass
+        _cur = 'x'                 # 读不到 → 老老实实清，别赌
+    if _cur.strip():
+        try:
+            # by_js=False 走真实按键（ctrl-a + del）。by_js=True 直接改 value
+            # 不会触发 React 的 onChange，框里看着有字但发出去是空的。
+            box.clear(by_js=False)
+        except Exception:
+            pass
 
     box.input(text)
     time.sleep(0.4)
@@ -1100,12 +1116,26 @@ def send_question(page, text, baseline='', attachments=None):
             log(f'[发送] {name} 报错：{str(e)[:50]}')
             continue
 
-        time.sleep(1.5)
-        # 两个独立信号，任一成立就算发出去了：
-        #   ① 输入框被清空  ② 最后一条回答的内容变了（新的回答开始覆盖它）
-        # 特意不用「回答节点个数变多」—— 那个受虚拟滚动和渲染时序影响，不稳。
-        if not still_pending() or last_answer_text(page) != baseline:
-            return
+        # ★ **轮询**等结果，不是死等（第十八轮补五提速）。
+        #
+        #   原来这里是 `time.sleep(1.5)` 再判一次。实测这两个信号通常在
+        #   0.1~0.3 秒内就成立（React 提交后立刻清空输入框），
+        #   剩下那一秒多是白等的 —— 而一轮短问答总共才 6 秒，
+        #   `send_question` 一家就占 2.56 秒（分阶段实测）。
+        #
+        #   判据一个字没改，只是把「睡 1.5 秒再看一眼」换成
+        #   「每 0.15 秒看一眼，最多看 1.5 秒」—— 超时预算一样。
+        #
+        #   两个独立信号，任一成立就算发出去了：
+        #     ① 输入框被清空  ② 最后一条回答的内容变了（新的回答开始覆盖它）
+        #   特意不用「回答节点个数变多」—— 那个受虚拟滚动和渲染时序影响，不稳。
+        _dl = time.time() + 1.5
+        while True:
+            if not still_pending() or last_answer_text(page) != baseline:
+                return
+            if time.time() >= _dl:
+                break
+            time.sleep(SEND_POLL)
         log(f'[发送] {name} 没生效，换一种方式')
 
     raise RuntimeError('三种发送方式都没能把消息发出去 —— 跑 ask --probe 看看选择器')
@@ -1185,7 +1215,7 @@ def _poll_interval(t0, now=None):
 
 
 def wait_answer(page, baseline, think, start_limit=None, total_limit=None,
-                search=False, on_delta=None):
+                search=False, on_delta=None, baseline_n=None):
     """
     等回答生成完。两道判据：
 
@@ -1211,6 +1241,24 @@ def wait_answer(page, baseline, think, start_limit=None, total_limit=None,
         total_limit = TOTAL_THINK if slow else TOTAL_NORMAL
 
     # --- 阶段 1：等回答开始。避免刚发出去就判空。 ---
+    #
+    # ★★ 两道判据，缺一不可（第十八轮补五）：
+    #   ① 内容变了（主判据）
+    #   ② **回答节点数变多了**（补判据）
+    #
+    #   为什么需要 ②：①是「拿新回答的文本和上一条比」，可**同一句话问两遍、
+    #   模型答得一字不差**时，新回答的文本**就等于** baseline ——
+    #   ① 永远不成立，于是干等满 90 秒报「回答没有开始」。
+    #   实测（`_same_answer_probe.py`）：连问四遍「只回答两个字：收到」，
+    #   页面上**确实有四条一模一样的「收到」**，而后三次全被判成「没开始」。
+    #   这不是理论：自测里 `普通对话正常` 和 `正常回答能拿到结果` 用的是
+    #   同一句话，第二条必然踩中。
+    #
+    #   为什么「数节点个数」在这里是安全的 —— 坑 2 那条纪律（别用节点数判状态）
+    #   针对的是**虚拟滚动**（对话变长时旧消息被移出 DOM，个数会**减**甚至不变）。
+    #   而这里要的是「**变多**」这个单向信号：滚动只会让个数减少或持平，
+    #   **不可能凭空多出一个**。所以「变多 ⇒ 一定来了新回答」成立。
+    #   ① 仍然保留 —— 它在「个数没变但内容变了」时不误判（比如节点被复用）。
     t_start = time.time()
     deadline = t_start + start_limit
     started = False
@@ -1218,6 +1266,11 @@ def wait_answer(page, baseline, think, start_limit=None, total_limit=None,
         txt = last_answer_text(page)
         if txt and txt != baseline:
             started = True
+            break
+        if baseline_n is not None and len(answers(page)) > baseline_n:
+            started = True
+            log(f'[回答] 内容与上一条相同，但回答节点数 {baseline_n} → '
+                f'{len(answers(page))}，按「已开始」处理')
             break
         time.sleep(_poll_interval(t_start))
     if not started:
@@ -1546,10 +1599,15 @@ def ask(page, question, think=False, attachments=None,
       抄三份改两份，这类错误必然会再犯。收敛成一个入口，就不会了。
     """
     baseline = last_answer_text(page)
+    # ★ 发送前记下「有几条回答」—— 给 wait_answer 当第二道判据用。
+    #   见它阶段 1 的说明：同一句话问两遍、答得一字不差时，
+    #   光比内容认不出新回答（实测连问四遍「只回答两个字：收到」全中）。
+    baseline_n = len(answers(page))
     send_question(page, question, baseline, attachments)
     text, err = wait_answer(page, baseline, think,
                             start_limit=start_limit, total_limit=total_limit,
-                            search=search, on_delta=on_delta)
+                            search=search, on_delta=on_delta,
+                            baseline_n=baseline_n)
     return (clean(text) if text else text), err
 
 
