@@ -743,9 +743,18 @@ _BLOCK_FIELD = {
 }
 
 
+# 非贪婪版代码块正则。**只在「多个调用各配一块」时用。**
+#
+# ★ 单个内容块时绝不能用它 —— 内容自带围栏很正常（写 .md、写带示例的脚本），
+#   非贪婪会在内容里第一次出现 ``` 时就收尾，文件被静默截断。那个坑见
+#   _CODE_BLOCK_RE 上面的说明（所以那一版是贪婪的，且保持不动）。
+#   多块配对的场合不一样：那里我们**知道**应该有几块，可以拿数量对账。
+_CODE_BLOCK_RE_NG = re.compile(r'```[a-zA-Z0-9_+\-]*\r?\n(.*?)\r?\n?\s*```', re.S)
+
+
 def _attach_code_block(text, tools):
     """
-    把 JSON 后面那个代码块的内容，补给工具调用里缺的那个长字段。
+    把 JSON 后面的代码块内容，补给工具调用里缺的那个长字段。
 
     ★ 为什么必须这么干：模型写文件内容时**几乎不可能每次都转义对** ——
       代码里的 `\"\"\"docstring\"\"\"`、`len("abc")` 会把 JSON 字符串提前截断，
@@ -754,34 +763,67 @@ def _attach_code_block(text, tools):
       长文本放代码块里，原样写。
 
     兼容两种写法：内容在 JSON 里（短内容）→ 不动；内容在代码块里 → 补进去。
+
+    ★★ 第十八轮补：**「一次多个调用 + 多个代码块」原来会静默写串**。
+      老实现只找**一块**，然后把它补给**每一个**缺字段的调用 —— 于是
+      「写脚本 + 写测试文本」这种一轮两个 Write 的活，两个文件拿到**同一份
+      内容**；而贪婪的正则又把两块焊在一起，**围栏也混进了文件里**。
+
+      这是 A/B 对拍（ab_check.py）跑一次就抓到的，而且是**模型自己先发现、
+      替我们收拾的** —— 它的叙述原话：
+          「sample.txt 被写成了脚本内容，我重写它」
+          「gen_report.py 里被混进了 markdown 围栏，我重写干净的脚本文件再跑」
+      也就是说这个 bug 一直在**偷轮数**：每次多花一两轮返工，日志干净、
+      自测全绿，只有拿两个后端对着跑才露出来。
+
+      修法：先数「有几个调用缺字段」，再按数量配对 ——
+        · 缺 1 个 → 老路径（贪婪抓一块），行为一个字节都不变
+        · 缺 N≥2 个 → 用非贪婪切出全部块；**数量正好对上才按顺序配**
+          （对不上说明分不清谁是谁，宁可一块都不挂，让「缺 content」那条
+            重试去报错 —— 大声失败 >> 悄悄写错文件）
     """
     if not tools:
         return tools
+
     # ★ 先把工具调用那段 JSON（连同包着它的围栏）切掉，再找内容块 —— 见
     #   _remove_tool_call_span 的说明。不切的话，贪婪的代码块正则会从
     #   「包 JSON 的那个围栏」一路吃到「内容那个围栏」，把 JSON 也当成内容。
-    m = _CODE_BLOCK_RE.search(_remove_tool_call_span(text))
-    if not m:
-        return tools
-    body = m.group(1)
+    region = _remove_tool_call_span(text)
 
+    # ★ 不认识的工具**什么都不填**（_BLOCK_FIELD 里没有它的名字就不在 need 里）。
+    #   早先这里会「填第一个空的文本类字段」—— 那是瞎猜，而且猜错是**必然**
+    #   被上游拒（参数非法，红的），比不填还糟：Read 没有 content、
+    #   WebFetch 没有 command、Task 的长字段叫 prompt 不叫 content。
+    #   要支持新工具就往 _BLOCK_FIELD 里加一条，别让它猜。
+    need = [(i, _BLOCK_FIELD[t.get('name')])
+            for i, t in enumerate(tools)
+            if _BLOCK_FIELD.get(t.get('name'))
+            and not (t.get('input') or {}).get(_BLOCK_FIELD[t.get('name')])]
+    if not need:
+        return tools
+
+    if len(need) == 1:
+        m = _CODE_BLOCK_RE.search(region)
+        if not m:
+            return tools
+        bodies = [m.group(1)]
+    else:
+        bodies = [m.group(1) for m in _CODE_BLOCK_RE_NG.finditer(region)]
+        if len(bodies) != len(need):
+            ds.log('[提示] %d 个调用缺长字段，但切出 %d 块代码 —— 分不清谁配谁，'
+                   '一块都不挂（交给重试报错，总比写错文件强）'
+                   % (len(need), len(bodies)))
+            return tools
+        ds.log('[提示] %d 个调用各配一块代码块（按出现顺序）' % len(bodies))
+
+    fill = {i: body for (i, _f), body in zip(need, bodies)}
     out = []
-    for t in tools:
+    for i, t in enumerate(tools):
         t = dict(t)
-        inp = dict(t.get('input') or {})
-        field = _BLOCK_FIELD.get(t.get('name'))
-        if field is None:
-            # ★ 不认识的工具**什么都不填**。
-            #   早先这里会「填第一个空的文本类字段」—— 那是瞎猜，而且猜错是
-            #   **必然**被上游拒（参数非法，红的），比不填还糟：
-            #     Read 没有 content、WebFetch 没有 command、
-            #     Task 的长字段叫 prompt 不叫 content。
-            #   要支持新工具就往 _BLOCK_FIELD 里加一条，别让它猜。
-            out.append(t)
-            continue
-        if not inp.get(field):
-            inp[field] = body
-        t['input'] = inp
+        if i in fill:
+            inp = dict(t.get('input') or {})
+            inp[_BLOCK_FIELD[t.get('name')]] = fill[i]
+            t['input'] = inp
         out.append(t)
     return out
 

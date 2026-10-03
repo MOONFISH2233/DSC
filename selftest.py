@@ -245,6 +245,66 @@ def test_unit():
           and not r6[1][0]['input'].get('content'),
           str(r6)[:140])
 
+    # ★★ 第十八轮补：**一次多个调用 + 多个代码块**会静默写串。
+    #
+    #   老实现只找**一块**代码，然后补给**每一个**缺字段的调用 ——
+    #   「写脚本 + 写测试文本」这种一轮两个 Write 的活，两个文件拿到同一份内容；
+    #   而贪婪的正则把两块焊在一起，**围栏也混进了文件里**。
+    #
+    #   这是 A/B 对拍（ab_check.py）跑一次就抓到的，而且是**模型自己先发现、
+    #   替我们收拾的** —— 它的叙述原话：
+    #       「sample.txt 被写成了脚本内容，我重写它」
+    #       「gen_report.py 里被混进了 markdown 围栏，我重写干净的脚本文件再跑」
+    #   所以这个 bug 一直在**偷轮数**：每次多花一两轮返工，而日志干净、
+    #   自测全绿 —— 只有拿两个后端对着跑才露出来。
+    _SC = 'import sys\n\n\ndef main():\n    print("hi")\n'
+    _SAMPLE = 'the quick brown fox\njumps over the lazy dog\n'
+    _two = ('我先写脚本，再造个测试文本。\n\n'
+            '{"tool_use": ['
+            '{"name": "Write", "input": {"file_path": "D:' + B + 't' + B + 'gen.py"}}, '
+            '{"name": "Write", "input": {"file_path": "D:' + B + 't' + B + 'sample.txt"}}'
+            ']}\n'
+            '```python\n' + _SC + '```\n'
+            '```text\n' + _SAMPLE + '```\n')
+    _r2 = cs.parse_reply(_two)
+    check('两个 Write + 两个代码块能解析', _r2[0] == 'tools' and len(_r2[1]) == 2,
+          str(_r2)[:110])
+    if _r2[0] == 'tools' and len(_r2[1]) == 2:
+        _c1 = _r2[1][0]['input'].get('content') or ''
+        _c2 = _r2[1][1]['input'].get('content') or ''
+        check('★ 第一个文件拿到第一块内容（脚本）',
+              _SC.strip() in _c1 and _SAMPLE.strip() not in _c1, repr(_c1[:60]))
+        check('★ 第二个文件拿到第二块内容（文本）',
+              _SAMPLE.strip() in _c2 and _SC.strip() not in _c2, repr(_c2[:60]))
+        check('★ 两份内容不能相同（老实现就是同一份）', _c1 != _c2,
+              '两个文件拿到同一份内容 = 静默写串')
+        check('★ 内容里不能混进围栏（老实现把两块焊在一起）',
+              '```' not in _c1 and '```' not in _c2,
+              repr((_c1[-40:], _c2[-40:])))
+    # 数量对不上时**不许猜**：宁可一块都不挂，让「缺 content」的重试去报错
+    _three = ('{"tool_use": ['
+              '{"name": "Write", "input": {"file_path": "a"}}, '
+              '{"name": "Write", "input": {"file_path": "b"}}]}\n'
+              '```\nonly one block\n```\n')
+    _r3b = cs.parse_reply(_three)
+    check('★ 块数和调用数对不上时，一块都不挂（不猜）',
+          _r3b[0] == 'tools'
+          and not (_r3b[1][0]['input'].get('content')
+                   or _r3b[1][1]['input'].get('content')),
+          str(_r3b)[:140])
+
+    # ★ 单块那条路**必须一个字节都没变**：内容自带围栏时，非贪婪会静默截断
+    #   （这正是 _CODE_BLOCK_RE 当初改成贪婪的原因）。上面那个多块分支
+    #   不能把这条路带坏。
+    _fenced = ('{"tool_use": {"name": "Write", "input": {"file_path": "a.md"}}}\n'
+               '```markdown\n# 标题\n\n```python\nprint(1)\n```\n\n结尾\n```')
+    _rf = cs.parse_reply(_fenced)
+    check('★ 单块且内容自带围栏时，仍然吃到最后一个围栏（不能截断）',
+          _rf[0] == 'tools'
+          and 'print(1)' in (_rf[1][0]['input'].get('content') or '')
+          and '结尾' in (_rf[1][0]['input'].get('content') or ''),
+          repr((_rf[1][0]['input'].get('content') or '')[:80]))
+
     PS = [{'name': 'PowerShell'}]
     check('★ PowerShell 缺 command 要触发重试',
           cs.incomplete_tool([{'name': 'PowerShell', 'input': {}}]) is not None)

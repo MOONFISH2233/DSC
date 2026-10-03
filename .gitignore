@@ -12,6 +12,8 @@ browser_profile/
 
 # ── 临时/自检残留 ──
 _e2e_tmp/
+# A/B 对拍的产物（ab_check.py）—— 每跑一次就不一样，是证据不是源码
+_ab_tmp/
 *.bak
 
 # ── 恢复过程中的中间文件（保留 DEVLOG.md 本身）──

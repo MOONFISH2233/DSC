@@ -101,7 +101,7 @@ def shim_up(url, timeout=3):
         return False
 
 
-def start_shim(port):
+def start_shim(port, tmp_dir=None):
     """
     自己起一个，跑完就关 —— 这样不依赖用户是否开着 dsc。
 
@@ -111,8 +111,15 @@ def start_shim(port):
       （实测第一版就数错了：把自己这轮的 2 次重试数成了 4 次）。
       ds.log() 同时往 stderr 和公共日志各写一份，所以收 stderr 就拿得到，
       而且**只有我们自己**的行。
+
+    tmp_dir 是「这个文件放哪」。默认放本模块的 TMP_DIR（e2e 的行为不变）；
+    别的脚本（ab_check）借用本函数时传自己的目录 —— 它不该往一个
+    **自己不拥有、也不保证存在**的目录里写（实测：ab_check 借去用，
+    而它并不建 _e2e_tmp，于是直接 FileNotFoundError）。
     """
-    errpath = os.path.join(TMP_DIR, 'shim_stderr.log')
+    d = tmp_dir or TMP_DIR
+    os.makedirs(d, exist_ok=True)
+    errpath = os.path.join(d, 'shim_stderr.log')
     errf = open(errpath, 'wb')
     py = sys.executable
     proc = subprocess.Popen(
