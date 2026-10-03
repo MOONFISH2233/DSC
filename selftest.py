@@ -582,6 +582,12 @@ def test_unit():
     #   后续轮次。这正是第十五轮补 缺陷 34 的同一个坑（规则只在第一轮出现）。
     check('★ delta 路径也提醒工具名（跑命令那个叫 PowerShell）',
           'PowerShell' in _d, _d[:150])
+    # ★ 解释器那条也必须在 delta 里 —— 它是**每一轮**跑命令时都要用的，
+    #   只在第一轮说一次，模型从第二轮起照样去试 `py -3`（缺陷 34/48 同一个坑）。
+    check('★ delta 路径也提醒解释器（别用 py -3）',
+          'py -3' in _d, _d[:200])
+    check('build_prompt 里也讲了解释器这件事',
+          'py -3' in cs.build_prompt('你是助手', _msgs, _t))
 
     # ★★ 第十八轮补：delta 路径**必须跟着 tools 分岔**。
     #

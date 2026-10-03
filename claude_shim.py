@@ -321,6 +321,12 @@ TOOL_GUIDANCE = """
 
 ★ **工具名必须和「可用工具」清单里的一字不差。** 尤其注意：这台机器上跑命令的
   工具叫 `PowerShell`，**不叫 `Bash`**。名字写错那个调用会被直接丢弃，整轮白费。
+
+★ **要跑 Python 就用 `python`（或 `py -3.11`），不要用 `py -3`。**
+  这台机器上 `py -3` 指向一个坏掉的解释器，会报 `Unable to create process`。
+  实测（A/B 对拍 20 轮）：模型习惯性地先试 `py -3`，撞一次错、再花一整轮去找
+  能用的解释器 —— 光这一个习惯就让「建几个 py 文件再跑起来」这类任务
+  多花 2 轮。**直接写 `python xxx.py` 就对了。**
 """
 
 
@@ -1670,7 +1676,8 @@ def build_delta_prompt(new_msgs, tools=None):
             #   模型从第二轮起就把这些工具忘光了。
             '（有岔路口要人拍板 → 用 AskUserQuestion 问，别自己猜；'
             '复杂的活 → 先 EnterPlanMode 拿方案；三步以上 → 先 TodoWrite 列清单；'
-            '工具名照抄清单 —— 跑命令那个叫 `PowerShell`，不叫 `Bash`。）')
+            '工具名照抄清单 —— 跑命令那个叫 `PowerShell`，不叫 `Bash`；'
+            '跑 Python 用 `python`，**别用 `py -3`**（这台机器上它是坏的）。）')
 
 
 def ask_web(prompt, goto_url=None, think=None, attachments=None,
