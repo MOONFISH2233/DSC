@@ -2370,6 +2370,20 @@ class Handler(BaseHTTPRequestHandler):
 
         prompt, goto, payload_msgs, note = decide_prompt(messages, info, system, tools)
         ds.log(f'[会话 {(sid or "?")[:8]}] {note} · 提示词 {len(prompt)} 字')
+        # ★ 把「Claude Code 这一轮到底给了多少工具、都是什么」记下来（补九）。
+        #
+        #   为什么值得记：dsc 起 claude 时带了 `--strict-mcp-config` 且没给
+        #   `--mcp-config`，也就是**一个 MCP 都不加载**。于是同一台机器上，
+        #   普通 claude 手上有 browser/playwright/vision 这些，
+        #   而 dsc 一个都没有 —— 用户拿一个**需要浏览器**的任务（下载腾讯文档
+        #   附件）去问 dsc，它只能说「我打不开那个链接」。
+        #   这不是「模型不行」，是**我们把它手捆上了**。
+        #   记下来，下次一眼能看出 dsc 手里有什么。
+        _tn = [t.get('name') for t in (tools or []) if isinstance(t, dict)]
+        _mcpish = sorted(n for n in _tn if n and not n.isascii())
+        ds.log(f'[工具清单] {len(_tn)} 个'
+               + (f'，其中非 ASCII 名的 {len(_mcpish)} 个：{_mcpish[:12]}' if _mcpish else '')
+               + f'；前 15 个：{_tn[:15]}')
 
         # 图片/PDF 这类二进制内容走附件上传，不能当文本发（当文本就是乱码）
         attach = extract_attachments(payload_msgs)
