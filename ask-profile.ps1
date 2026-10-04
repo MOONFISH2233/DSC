@@ -90,9 +90,28 @@ function dsc {
     }
 
     Write-Host '[dsc] 后端 = DeepSeek 网页版（免费，每轮约 10-60 秒）' -ForegroundColor DarkCyan
-    # --strict-mcp-config：不加载任何 MCP。
-    # 你的 10 个 MCP 会贡献 60+ 个工具定义，每轮都要重发，白白吃掉上下文。
-    & claude --settings $conf --strict-mcp-config @args
+
+    # ── MCP 开关（第十八轮补九）──
+    #
+    # 原先**无条件**带 `--strict-mcp-config`（= 一个 MCP 都不加载），
+    # 理由写在注释里：「10 个 MCP 会贡献 60+ 个工具定义，每轮都要重发，
+    # 白白吃掉上下文」。
+    #
+    # ★ 那个理由现在站不住了 —— 补三量过：**提示词大 13 倍、耗时一样**。
+    #   而代价很实：普通 claude 手上有 browser / playwright / vision，
+    #   dsc 一个都没有。用户拿一道**需要浏览器**的题（下载腾讯文档附件）
+    #   去问 dsc，它只能说「我打不开那个链接」——
+    #   不是模型不行，是我们把它手捆上了。
+    #
+    # ★ 所以改成**默认加载**（跟普通 claude 对齐），想省上下文就 `dscmcp off`。
+    $mcpOff = Test-Path "D:\创业\deepseek_ask\.dsc_mcp_off"
+    if ($mcpOff) {
+        Write-Host '[dsc] MCP：关（dscmcp on 可以打开）' -ForegroundColor DarkGray
+        & claude --settings $conf --strict-mcp-config @args
+    } else {
+        Write-Host '[dsc] MCP：开 —— 和普通 claude 一样（dscmcp off 可以关）' -ForegroundColor DarkGray
+        & claude --settings $conf @args
+    }
 }
 
 Set-Alias -Name dsclaude -Value dsc -Force   # 旧名字留着，不影响
@@ -158,6 +177,49 @@ function _dstoggle {
         Write-Host "[$Name] shim 没在跑 —— 先开一个 dsc。" -ForegroundColor Yellow
     }
 }
+
+function dscmcp {
+    <#
+    .SYNOPSIS
+        切 dsc 要不要加载 MCP 工具（浏览器 / 看图 / 飞书 / GitHub…）。
+
+    .DESCRIPTION
+        默认**开** —— 和普通 claude 一样。这样 dsc 才有 browser / playwright
+        这些工具，能开网页、点页面、抓接口。
+
+        关掉的话提示词会小一截（少 60+ 个工具定义），但 dsc 就**干不了**
+        需要浏览器的活 —— 实测：给它一道「下载腾讯文档里的附件」的题，
+        没有 browser 时它只能回一句「我打不开那个链接」。
+
+        ★ 注意反直觉的一点：**关掉并不明显变快**。实测提示词大 13 倍、
+          耗时基本一样（瓶颈在模型生成，不在发多少字）。
+          所以除非你明确想省上下文，否则别关。
+
+    .EXAMPLE
+        dscmcp          # 看当前状态
+        dscmcp on       # 开（默认）
+        dscmcp off      # 关
+        dscmcp toggle   # 翻转
+
+    注意：这个开关**下次开 dsc 才生效**（它决定 claude 怎么启动）。
+    #>
+    param([string]$Mode = "")
+    $flag = "D:\创业\deepseek_ask\.dsc_mcp_off"
+    $off = Test-Path $flag
+    if ($Mode -eq 'on') { Remove-Item $flag -Force -ErrorAction SilentlyContinue; $off = $false }
+    elseif ($Mode -eq 'off') { New-Item -ItemType File -Path $flag -Force | Out-Null; $off = $true }
+    elseif ($Mode -eq 'toggle') {
+        if ($off) { Remove-Item $flag -Force -ErrorAction SilentlyContinue; $off = $false }
+        else { New-Item -ItemType File -Path $flag -Force | Out-Null; $off = $true }
+    }
+    $verb = if ($Mode) { '已切到' } else { '当前' }
+    Write-Host "[dscmcp] $verb ：$(if ($off) { '关' } else { '开' })" -ForegroundColor Cyan
+    if ($off) {
+        Write-Host '         关掉后 dsc 没有浏览器 / 看图这些工具 —— 需要它们的活干不了。' -ForegroundColor DarkGray
+    }
+    Write-Host '         （下次开 dsc 生效）' -ForegroundColor DarkGray
+}
+
 
 function dscthink {
     <#
