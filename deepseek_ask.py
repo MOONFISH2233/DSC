@@ -471,6 +471,24 @@ def _pid_alive(pid):
         return True
 
 
+# 锁的「陈旧」判据（第十八轮补六）。
+#
+# ★ 为什么除了「持有者进程死了」之外还需要这两条：
+#   **PID 还活着 ≠ 锁还有人管。**
+#
+#   实测（用户报「dsc 之后网页没有自己打开」）：
+#     浏览器窗口被关掉 → 飞在半路的 CDP 调用**没有超时**，就那么挂着 →
+#     `with browser_lock` 那块代码永远不退出 → 锁文件再也不删 →
+#     之后每个请求排队 240 秒然后失败。
+#     而**重启浏览器那一步（ensure_browser）在锁里面** ——
+#     所以它永远轮不到，「网页不会自己打开」看着像功能坏了，
+#     其实是锁把自己锁死了（日志里只有一句 `[锁] 浏览器被别的任务占着，排队等…`，
+#     而且持有者写的正是**它自己的 pid** —— 它自己等自己）。
+STALE_NO_BROWSER = 90.0     # 持有者活着但浏览器都没了 → 这么久就当它卡死
+STALE_MAX_HOLD = 1500.0     # 兜底：任何操作都不该持锁这么久
+                            # （TOTAL_THINK=1200 秒是单轮上限，留 300 秒余量）
+
+
 @contextlib.contextmanager
 def browser_lock(key=None, timeout=240.0, poll=0.5):
     """
@@ -504,14 +522,27 @@ def browser_lock(key=None, timeout=240.0, poll=0.5):
             now = time.time()
             if now - last_check > 10:
                 last_check = now
-                owner = 0
+                owner, age = 0, 0.0
                 try:
                     with open(path) as f:
                         owner = int((f.read() or '0').strip() or 0)
+                    age = now - os.path.getmtime(path)
                 except Exception:
                     pass
+                why = ''
+                # ① 持有者进程死了 —— 原有的规则
                 if owner and not _pid_alive(owner):
-                    log(f'[锁] 持有者进程 {owner} 已经不在了，接管')
+                    why = f'持有者进程 {owner} 已经不在了'
+                # ② 持有者**活着**，但浏览器都没了 —— 卡死（见上面那段说明）
+                elif age > STALE_NO_BROWSER and not port_alive():
+                    why = (f'持有者 {owner} 虽然活着，可浏览器已经没了、'
+                           f'这把锁又被握了 {age:.0f} 秒 —— '
+                           f'多半是 CDP 调用挂在死连接上，等不到它释放了')
+                # ③ 兜底：持得太久，任何正常操作都不会这样
+                elif age > STALE_MAX_HOLD:
+                    why = f'这把锁已经被握了 {age:.0f} 秒，超过上限'
+                if why:
+                    log(f'[锁] {why}，接管')
                     try:
                         os.remove(path)
                     except Exception:
@@ -532,8 +563,14 @@ def browser_lock(key=None, timeout=240.0, poll=0.5):
             os.close(fd)
         except Exception:
             pass
+        # ★ 只删「还是我的」那把锁。
+        #   万一这中间有别人判我们陈旧、接管了，现在文件里写的是**他的** pid ——
+        #   这时候删了就等于把他的锁偷走（他以为自己持着，其实门开着）。
+        #   这条在加了「活着也可能被判陈旧」之后才变得必要：以前只有
+        #   「持有者死了」才会被接管，而死人是不会走到这行代码的。
         try:
-            os.remove(path)
+            if open(path).read().strip() == str(os.getpid()):
+                os.remove(path)
         except Exception:
             pass
 

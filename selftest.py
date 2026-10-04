@@ -1099,6 +1099,67 @@ def test_unit():
         except Exception as e:
             check('★ 持有者死了能自动接管', False, str(e))
         check('接管后锁也释放了', not os.path.exists(lockf))
+
+        # ★★ 第十八轮补六：**持有者活着、但锁已经没意义了**。
+        #
+        #   实测（用户报「dsc 之后网页没有自己打开」）：浏览器窗口被关掉，
+        #   飞在半路的 CDP 调用没有超时、一直挂着 → `with browser_lock`
+        #   永远不退出 → 锁文件再也不删。而重启浏览器那一步在锁**里面**，
+        #   所以永远轮不到 —— 表现就是「网页不会自己打开了」。
+        #   日志里只有一句 `排队等…`，而锁里写的正是**它自己的 pid**。
+        #
+        #   老规则只查「持有者进程死没死」，这种情况一个字都管不到。
+        _saved_pa = dsl.port_alive
+        try:
+            # 场景一：持有者（本进程，肯定活着）持锁很久，且浏览器没了 → 接管
+            dsl.port_alive = lambda *a, **k: False
+            with open(lockf, 'w') as f:
+                f.write(str(os.getpid()))          # 活着的 pid —— 老规则拦不住
+            old = time.time() - (dsl.STALE_NO_BROWSER + 30)
+            os.utime(lockf, (old, old))
+            t0 = time.time()
+            try:
+                with dsl.browser_lock(timeout=40, poll=0.2):
+                    dt = time.time() - t0
+                    check('★ 持有者活着但浏览器没了 → 也能接管（卡死恢复）',
+                          dt < 25, f'等了 {dt:.1f} 秒')
+            except Exception as e:
+                check('★ 持有者活着但浏览器没了 → 也能接管（卡死恢复）',
+                      False, str(e))
+
+            # 场景二：持有者活着、浏览器也还在、锁还很新 → **绝不能抢**
+            #   （正常干活中，抢了就是两个进程同时驱动一个浏览器）
+            dsl.port_alive = lambda *a, **k: True
+            with open(lockf, 'w') as f:
+                f.write(str(os.getpid()))
+            os.utime(lockf, None)                  # mtime = 现在
+            try:
+                with dsl.browser_lock(timeout=2, poll=0.2):
+                    check('★ 正常持有中的锁不能被抢走', False,
+                          '不该拿到 —— 这会变成两个进程驱动一个浏览器')
+            except Exception:
+                check('★ 正常持有中的锁不能被抢走', True)
+
+            # 场景三：兜底上限 —— 无论浏览器在不在，握太久就该接管
+            dsl.port_alive = lambda *a, **k: True
+            with open(lockf, 'w') as f:
+                f.write(str(os.getpid()))
+            old = time.time() - (dsl.STALE_MAX_HOLD + 60)
+            os.utime(lockf, (old, old))
+            t0 = time.time()
+            try:
+                with dsl.browser_lock(timeout=40, poll=0.2):
+                    dt = time.time() - t0
+                    check('★ 握太久（超过兜底上限）也能接管', dt < 25,
+                          f'等了 {dt:.1f} 秒')
+            except Exception as e:
+                check('★ 握太久（超过兜底上限）也能接管', False, str(e))
+        finally:
+            dsl.port_alive = _saved_pa
+            try:
+                os.remove(lockf)
+            except Exception:
+                pass
     finally:
         dsl.BROWSER_LOCK = real_lock
         try:
@@ -1252,6 +1313,68 @@ def test_unit():
               err3 is not None, f'err={err3!r}')
     finally:
         (dsc.last_answer_text, dsc.answers, dsc.STABLE_NORMAL, dsc.POLL) = _saved3
+
+    section('单元 · DeepSeek 原生 DSML 标记（缺陷 59）')
+    # ★★ 第十八轮补六：模型偶尔**不写我们的 JSON 协议**，而是吐 DeepSeek
+    #   自己的原生 DSML 标记。我们的解析器一个字都不认，于是那个调用要么被
+    #   当「坏掉的工具调用」白白重试（实测 07:19:21 那次就是这么废的），
+    #   要么当普通文字漏给用户 —— 用户看到「模型问了个问题，但什么都没发生」。
+    #
+    #   ★ 我早先判断错过一次：补四那晚只见到 1 处 DSML，就写下「个别现象，
+    #     不值得写解析器」。它不是噪声，只是一直**失败得很安静**（连日志都没有）。
+    #
+    #   ★ 下面用**拼出来的**标签构造样本 —— 源码里不出现字面的标记
+    #     （这套尖括号写法在别的场合会被当成真的工具调用，我自己就被咬过）。
+    F = chr(0xFF5C) * 2 + 'DSML' + chr(0xFF5C) * 2
+    _o = lambda tag: '<' + F + ' ' + tag + '>'
+    _c = lambda tag: '</' + F + ' ' + tag + '>'
+    _inv = lambda n: '<' + F + ' invoke name="' + n + '">'
+    _par = lambda n, s=None: ('<' + F + ' parameter name="' + n + '"'
+                              + ('' if s is None else ' string="' + s + '"') + '>')
+    _dsml = (_o('calls') + _inv('AskUserQuestion')
+             + _par('questions', 'false')
+             + '[{"question": "先写哪一块？", "header": "方向", '
+               '"options": [{"label": "A", "description": "甲"}]}]'
+             + _c('parameter') + _c('invoke') + _c('calls'))
+
+    _pd = cs.parse_reply(_dsml)
+    check('★ DSML 标记能翻译成工具调用', _pd[0] == 'tools', str(_pd)[:120])
+    if _pd[0] == 'tools':
+        check('★ 工具名对', _pd[1][0]['name'] == 'AskUserQuestion', str(_pd[1][0])[:80])
+        check('★ input 是字典（上游只认字典）',
+              isinstance(_pd[1][0]['input'], dict), repr(_pd[1][0]['input'])[:80])
+        # ★ 这条最要紧：string="false" 说明那坨是 JSON，必须还原成**列表**。
+        #   还原成字符串的话，Claude Code 就报「参数解不出来」——正是用户看到的。
+        check('★ string="false" 的参数要还原成列表，不能是字符串',
+              isinstance(_pd[1][0]['input'].get('questions'), list),
+              repr(_pd[1][0]['input'].get('questions'))[:120])
+    # 纯文本参数（没写 string / string="true"）保持字符串
+    _plain = (_inv('Write') + _par('file_path') + 'D:/t/a.py' + _c('parameter')
+              + _c('invoke'))
+    _pp = cs.parse_reply(_plain)
+    check('纯文本参数保持字符串',
+          _pp[0] == 'tools' and _pp[1][0]['input'].get('file_path') == 'D:/t/a.py',
+          str(_pp)[:100])
+    # 前面带叙述也要认，而且叙述要留给用户看
+    _withprose = '我先确认一下方向。\n\n' + _dsml
+    _pw = cs.parse_reply(_withprose)
+    check('★ DSML 前面带叙述也认，且叙述保住',
+          _pw[0] == 'tools' and '确认一下方向' in (_pw[2] or ''), str(_pw)[:120])
+    check('没有 DSML 时不影响正常解析（返回空）',
+          cs._dsml_tools('普通回答，没有标记') == [])
+    # ★ 残缺的 DSML（翻译不出来）**必须算坏输出去重试**，
+    #   否则它当「回答」交出去，用户看到的是一屏尖括号标记。
+    _btrunc = _o('calls') + _inv('AskUserQuestion') + _par('questions', 'false') \
+        + '[{"question": "被截断'
+    check('★ 残缺的 DSML 要判成坏输出（触发重试，不能当回答漏出去）',
+          cs.looks_broken(_btrunc), repr(_btrunc[:80]))
+    # ★ 最后一道闸：input 不是字典的调用**一律不许放行**
+    _bad = cs.parse_and_align(
+        '{"tool_use": {"name": "Read", "input": "这不是字典"}}', [{'name': 'Read'}])
+    check('★ input 不是字典的调用不能被放行（否则上游报参数解不出来）',
+          _bad[0] != 'tools' or all(isinstance(t.get('input'), dict)
+                                    for t in _bad[1]),
+          str(_bad)[:140])
 
     section('单元 · 服务器繁忙不能当回答')
     # ★ 回归：服务端限流时页面弹「服务器繁忙，请稍后重试」，这一轮**根本没生成出

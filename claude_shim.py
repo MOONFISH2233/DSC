@@ -624,6 +624,65 @@ def _norm_tool(obj):
     return {'name': name.strip(), 'input': flat}
 
 
+# ── DSML：DeepSeek 的**原生**工具调用标记 ──────────────────
+#
+# ★ 为什么必须有这一段（第十八轮补六）：
+#   网页版偶尔不按我们教的 JSON 协议写，而是吐出**它自己的原生格式** ——
+#   用全角竖线包起来的 XML 式标记。实测现场（用户 dsc 会话）：
+#
+#       ｜｜DSML｜｜ invoke name="AskUserQuestion"
+#       ｜｜DSML｜｜ parameter name="questions" string="false">[...参数 JSON...]
+#       ｜｜DSML｜｜ /parameter  ｜｜DSML｜｜ /invoke  ｜｜DSML｜｜ /calls
+#
+#   而**我们的解析器一个字都不认** → 那个调用要么被当成「坏掉的工具调用」
+#   白白重试一轮（实测 07:19:21 那次就是这么废的），要么被当普通文字漏给
+#   用户 —— 用户那边看到的是「模型问了个问题，但什么都没发生」。
+#
+#   ★ 我早先**判断错过一次**：补四那晚扫日志只见到 1 处 DSML，当时写下
+#     「个别现象，不值得写解析器」。它不是噪声 —— 它一走就废掉一整轮，
+#     只是**失败得很安静**（连日志都没有，因为压根没进任何识别分支）。
+#     这一段的教训和缺陷 41/50 一模一样：**没被识别 = 没被记录 = 看不见**。
+#
+# ★ 参数要按 `string` 属性还原类型：`string="false"` 表示这坨是 **JSON**，
+#   得解析成对象/数组；`string="true"`（或没写）是**纯文本**。
+#   还原错了的后果很实在：`questions` 本该是数组，变成字符串的话
+#   Claude Code 直接报「参数解不出来」——正是用户看到的那个现象。
+_FWB = '｜｜DSML｜｜'          # ｜｜DSML｜｜
+_DSML_INVOKE_RE = re.compile(
+    r'<' + _FWB + r'\s*/?invoke\s+name="([^"]+)"\s*>(.*?)'
+    r'</' + _FWB + r'\s*/?invoke\s*>', re.S)
+_DSML_PARAM_RE = re.compile(
+    r'<' + _FWB + r'\s*/?parameter\s+name="([^"]+)"'
+    r'(?:\s+string="(true|false)")?\s*>(.*?)'
+    r'</' + _FWB + r'\s*/?parameter\s*>', re.S)
+
+
+def _dsml_tools(text):
+    """
+    从 DSML 标记里抠工具调用，返回 [{'name':..., 'input':{...}}, ...]。
+    没有 DSML 就返回 []。**input 一定是 dict**（上游只认 dict）。
+    """
+    if 'DSML' not in text:
+        return []
+    out = []
+    for m in _DSML_INVOKE_RE.finditer(text):
+        name = (m.group(1) or '').strip()
+        if not name:
+            continue
+        inp = {}
+        for pm in _DSML_PARAM_RE.finditer(m.group(2)):
+            key, is_str, raw = pm.group(1), pm.group(2), pm.group(3)
+            raw = (raw or '').strip()
+            if is_str == 'false':
+                # 明确说了是 JSON —— 解析；解不出来就原样留着（别把内容丢了）
+                v = _loads_lenient(raw)
+                inp[key] = v if isinstance(v, (dict, list)) else raw
+            else:
+                inp[key] = raw
+        out.append({'name': name, 'input': inp})
+    return out
+
+
 def _tools_from(obj):
     """
     从一个 JSON 对象里抠出工具调用列表（可能是 0 个、1 个或多个）。
@@ -1236,6 +1295,22 @@ def parse_reply(raw):
                     if isinstance(v, str) and v.strip():
                         return ('reply', v, '')
 
+    # ★ 模型偶尔不写我们的 JSON 协议，而是吐 **DeepSeek 原生的 DSML 标记**
+    #   （第十八轮补六）。认不出来的话，那个调用要么被当「坏掉的工具调用」
+    #   白白重试一轮，要么当普通文字漏给用户 —— 用户看到的是
+    #   「模型问了个问题，但什么都没发生」。见 `_dsml_tools` 上面那段说明。
+    #
+    #   ★ 放在「夹带提取」**之前**：DSML 是**结构化**的，比从自由文本里
+    #     猜调用可靠得多。两边都能抠出来时应优先信它。
+    _d = _dsml_tools(t)
+    if _d:
+        ds.log(f'[提示] 模型用了 DeepSeek 原生 DSML 标记，已翻译成 '
+               f'{len(_d)} 个工具调用：{ [x["name"] for x in _d] }')
+        # 叙述 = 第一个 invoke 之前那段（把标记本身从用户看的文字里去掉）
+        _m = _DSML_INVOKE_RE.search(t)
+        prose = t[:_m.start()].strip()[:MAX_PROSE_CHARS] if _m else ''
+        return ('tools', _attach_code_block(t, _d), prose)
+
     # 整段不是 JSON —— 但可能是「先解释一段、再给工具调用」的混合输出。
     # 模型在上一步失败之后特别爱这么写。整段当回答返回的话，
     # 用户看到的就是一坨 JSON 文本、任务直接断掉。
@@ -1299,6 +1374,17 @@ def looks_broken(raw):
     if not raw:
         return False
     t = raw.strip()
+
+    # ⓪ DSML 标记**没被翻译成功**时，照样算坏（应该重试）。
+    #
+    #   `parse_reply` 会先试 `_dsml_tools()`；能翻出来就正常返回工具调用，
+    #   走不到这里。**走到这里说明那坨 DSML 是残缺的**（被截断、标签不配对……），
+    #   而残缺的 DSML 当「回答」交出去，用户看到的是一屏尖括号标记 ——
+    #   既看不懂、也没法回答。宁可重试一轮。
+    #
+    #   （只认 DSML 这个字样，不认具体标签 —— 标签本身太容易被正常文字碰到。）
+    if 'DSML' in t:
+        return True
 
     # ① 「开了个头就没了」：以 { 开头、却不以 } 收尾 —— 必然是**被截断的 JSON**，
     #    不可能是完整回答。
@@ -1413,7 +1499,26 @@ def parse_and_align(raw, tools):
       有两份实现，改一份忘一份）。现在全仓只有这里调 parse_reply，
       加第三个解析点时也没法再漏 —— selftest 用 AST 钉住了这一点。
     """
-    return apply_tool_aliases(parse_reply(raw), tools)
+    parsed = apply_tool_aliases(parse_reply(raw), tools)
+    # ★ 最后一道闸：**input 必须是字典**（第十八轮补六）。
+    #
+    #   上游（Claude Code）拿到 input 不是字典的 tool_use 时会报
+    #   「参数解不出来 / InputValidationError」—— 这一轮直接废掉，
+    #   而用户看到的是「模型问了个问题，但什么都没发生」。
+    #   实测就是 DSML 标记被整段当成参数塞进 input 时出的。
+    #
+    #   宁可在这里**明确判成坏输出走重试**，也不要放它过去 ——
+    #   「把失败伪装成正常的工具调用」是这个项目反复栽的坑（缺陷 40/41 一脉）。
+    if parsed[0] == 'tools':
+        good = [t for t in parsed[1] if isinstance(t.get('input'), dict)]
+        if len(good) != len(parsed[1]):
+            ds.log(f'[警告] 有 {len(parsed[1]) - len(good)} 个工具调用的 input '
+                   f'不是字典（多半是格式没认出来），已丢弃')
+            if not good:
+                # 全废了 → 当成坏输出，交给重试路径
+                return ('reply', raw, parsed[2] if len(parsed) > 2 else '')
+            parsed = ('tools', good, parsed[2])
+    return parsed
 
 
 def should_retry(parsed, tools):
