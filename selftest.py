@@ -550,6 +550,12 @@ def test_unit():
     _dtail = cs.build_delta_prompt(_wm, _wt)
     check('  delta 路径也提醒了 WebSearch 不可用',
           'WebSearch' in _dtail, _dtail[-160:])
+    # ★ 实测那一轮 dsc 自己写了 Start-Sleep 25+90+120+75 = 5 分 10 秒在干等
+    #   （工具执行占那轮总时间的 63%）。这条规则两边都要有。
+    check('★ 提示词里讲了「别用 Start-Sleep 反复轮询」',
+          'Start-Sleep' in _gp, '')
+    check('  delta 路径也带这一条',
+          'Start-Sleep' in _dtail, _dtail[-200:])
     # ★ 真实 API 那边模型自己调 WebSearch；这边换成「它写标记、我们替它开」。
     #   判定必须**严**：只认整条回复就是标记 —— 模型解释这个协议本身时也会
     #   写出这几个字，误判就会白等 30 秒重搜一轮。
