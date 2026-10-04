@@ -1407,6 +1407,69 @@ def test_unit():
                                     for t in _bad[1]),
           str(_bad)[:140])
 
+    section('单元 · 回合自检（交出去的东西对不对）')
+    # ★★ 第十八轮补八：现有自愈**只管格式**（工具调用 JSON 坏了才重试），
+    #   而「最终回答本身是个残片」从来没人问过。用户现场：
+    #       14:28:22 [回答] 18 字  内容='README 里只写了文件名，没写下'
+    #   话断在半句上，直接交给上游，这一轮就此结束。
+    _frag = 'README 里只写了文件名，没写下'
+    check('★ 断在半句上的短回答要判成可疑（就是用户撞的那条）',
+          cs.turn_suspect(('reply', _frag, ''), _frag) is not None,
+          str(cs.turn_suspect(('reply', _frag, ''), _frag)))
+    # ★ 底线一：极短的回答是**完整的话**，不能判 ——
+    #   「收到」「好的」这种判成残片的话，每次简短回答都要白重问两遍
+    #   （自测自己就有一堆这种问句，会拖垮整个套件）。
+    for _s in ('收到', '好的', '完成', '已写入。'):
+        check(f'  极短/完整的回答不判：{_s!r}',
+              cs.turn_suspect(('reply', _s, ''), _s) is None, _s)
+    # 有句末标点的正常短回答不判
+    _ok = '文件已经写好了。'
+    check('  有句末标点的不判', cs.turn_suspect(('reply', _ok, ''), _ok) is None, _ok)
+    # 长回答不按残片处理（这条只抓「短 + 断在半句」）
+    _longans = '这是一段很长的回答。' * 30
+    check('  长回答不判', cs.turn_suspect(('reply', _longans, ''), _longans) is None)
+    # ★ 工具调用不归它管（那条路有 retry_reason）
+    check('  工具调用不判（交给 retry_reason）',
+          cs.turn_suspect(('tools', [{'name': 'Read', 'input': {}}], ''), 'x') is None)
+    # 含 DeepSeek 原生标记的最终回答一定可疑（用户看到的是一屏尖括号）
+    _ds = '前面的话 DSML 后面的话' * 10
+    check('  含 DSML 的最终回答判成可疑',
+          cs.turn_suspect(('reply', _ds, ''), _ds) is not None)
+    # ★ 底线二：正文里出现 [[SEARCH]] **不能**判 ——
+    #   模型解释这个协议时本来就会写到它，那是正当内容。
+    _exp = ('当我说 [[SEARCH]] 的时候，意思是这一轮需要联网搜索，'
+            '系统会替我打开开关然后把问题重发一遍。')
+    check('★ 解释标记协议的正文不能判成可疑（那是正当内容）',
+          cs.turn_suspect(('reply', _exp, ''), _exp) is None, _exp[:40])
+
+    # ★★ 「更长」不等于「接着写」—— 第一版的接受条件只写了「更长就收」，
+    #   结果把一段 266 字的**元回答**（「我看不到你说的上一条回复，
+    #   请把半截内容粘贴过来」）当成续写收了进来，**比原来那 18 字还糟**。
+    _frag2 = '水在标准大气压下的沸点大约是100摄氏'
+    _meta = ('我这边看不到你提到的「上一条回复」的具体内容，所以没法接着写。'
+             '你可以把上一条已写的一半内容直接粘贴过来，我接着往下写完。')
+    check('★ 元回答（答非所问）不能接',
+          cs.join_continuation(_frag2, _meta) is None)
+    check('★ 从头重写并写下去 → 直接用它',
+          cs.join_continuation(_frag2, _frag2 + '度。这是常识。')
+          == _frag2 + '度。这是常识。')
+    # ★★ 实测形状：模型**只给后半截**（提示词里写了「不要重复」，
+    #   它当然只给剩下的）。实测原话：残片「…水分蒸发盐留下」配
+    #   续写「，亿万年积累使海水变咸」—— 接得严丝合缝，必须**拼回去**。
+    _f3 = '雨水冲刷陆地岩石，把盐带入海洋，水分蒸发盐留下'
+    _half3 = '，亿万年积累使海水变咸'
+    check('★ 只给后半截 → 要拼回去（实测形状）',
+          cs.join_continuation(_f3, _half3) == _f3 + _half3,
+          repr(cs.join_continuation(_f3, _half3)))
+    # 重叠：模型把最后一句又重说了一遍 → 以残片的为准，不重复
+    _over = '盐留下，亿万年积累使海水变咸'
+    check('  有重叠时按残片的为准（不重复）',
+          cs.join_continuation(_f3, _over) == _f3 + '，亿万年积累使海水变咸',
+          repr(cs.join_continuation(_f3, _over)))
+    check('  跑题的长回答 → 不接',
+          cs.join_continuation(_frag2, '这个问题很有意思，我们可以从几个方面来看：首先……' * 5) is None)
+    check('  空 → 不接', cs.join_continuation(_frag2, '') is None)
+
     section('单元 · 服务器繁忙不能当回答')
     # ★ 回归：服务端限流时页面弹「服务器繁忙，请稍后重试」，这一轮**根本没生成出
     #   回答**，回答气泡里只剩 `{"` 两个字。它被当成「正经回答」交给上游后，
