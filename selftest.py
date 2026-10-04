@@ -519,6 +519,37 @@ def test_unit():
           f'stop 事件 {ev.count("event: content_block_stop")} 个')
 
     section('单元 · 模型申请开开关（[[SEARCH]] 标记）')
+    # ★ 第十八轮补七：**先说话、再另起一行写标记** —— 用户实撞的形状。
+    #   实测那条回复 53 字：「我需要先联网确认这四个模型文件的真实上游地址，
+    #   不能凭猜写进 workflow。\n\n[[SEARCH]]」
+    #   老判据只认「整条」和「第一行」，于是没认出来 —— 标记被当普通文字
+    #   露给用户，这一轮直接结束（它说要联网，然后什么都没发生）。
+    _tail = ('我需要先联网确认这四个模型文件的真实上游地址，'
+             '不能凭猜写进 workflow。\n\n[[SEARCH]]')
+    check('★ 先说话、标记在最后一行，也要认出来',
+          cs.parse_need_marker(_tail) == (True, False),
+          str(cs.parse_need_marker(_tail)))
+    check('  整条就是标记（原有行为不变）',
+          cs.parse_need_marker('[[SEARCH]]') == (True, False))
+    check('  第一行是标记（原有行为不变）',
+          cs.parse_need_marker('[[THINK]]\n我开一下深度思考') == (False, True))
+    # ★ 误判防线：长篇回答末尾贴个标记当例子 —— 不能触发重搜
+    _long = 'A' * (cs.MARKER_TAIL_MAX_CHARS + 50) + '\n\n[[SEARCH]]'
+    check('★ 长篇回答末尾的标记不认（防「解释协议时举例」误判）',
+          cs.parse_need_marker(_long) == (False, False),
+          str(len(_long)))
+    # 夹在句子中间的标记永远不认（那是解释，不是申请）
+    check('★ 夹在句子中间的标记不认',
+          cs.parse_need_marker('当我说 [[SEARCH]] 的时候意思是联网') == (False, False))
+    # ★ WebSearch 那条路走不通 —— 提示词里必须点明（否则白烧两轮）
+    _wt = [{'name': 'Read', 'description': '读文件', 'input_schema': {}}]
+    _wm = [{'role': 'user', 'content': 'x'}]
+    _gp = cs.build_prompt('你是助手', _wm, _wt)
+    check('★ 提示词里点明别调 WebSearch（要走 [[SEARCH]] 标记）',
+          'WebSearch' in _gp and 'SEARCH' in _gp, '')
+    _dtail = cs.build_delta_prompt(_wm, _wt)
+    check('  delta 路径也提醒了 WebSearch 不可用',
+          'WebSearch' in _dtail, _dtail[-160:])
     # ★ 真实 API 那边模型自己调 WebSearch；这边换成「它写标记、我们替它开」。
     #   判定必须**严**：只认整条回复就是标记 —— 模型解释这个协议本身时也会
     #   写出这几个字，误判就会白等 30 秒重搜一轮。

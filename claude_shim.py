@@ -229,6 +229,12 @@ OUTPUT_RULES = """
   ⚠️ 这一轮**不要**再按「情况一」先说一句说明 —— 申请开关的时候，
      整条回复就只是那个标记。
 
+  ★★ **别去调 `WebSearch` 工具**（第十八轮补七，实测踩过）。
+     工具清单里虽然有它，但**这条链路在我们这边执行不了** ——
+     你调了也拿不到任何结果，只会白烧一轮，然后你可能又去试
+     `web_search` 之类的名字，再烧一轮。**要联网就写 `[[SEARCH]]` 标记**，
+     那条路是通的。（`WebFetch` 抓具体网址是可以用的，别搞混。）
+
 ★ **别滥用**：搜索每轮要多等 30 秒以上，深度思考每轮要好几分钟。
   日常问答、读文件、改代码、跑命令，都不需要。判断不了就别加，
   硬答一版出来比空等一轮强。
@@ -1340,6 +1346,10 @@ def parse_reply(raw):
 #   （比如被问到「你怎么联网的」）时也会写出这几个字，那绝不能触发重搜。
 NEED_MARKER_RE = re.compile(r'^\s*\[\[\s*([A-Za-z+\s]+?)\s*\]\]\s*$')
 
+# 「最后一行是标记」这条额外判据只在**短回复**上生效（见 parse_need_marker）。
+# 300 字是拿实测定的：真实的申请是 53 字，长篇解释协议的回答远不止这个数。
+MARKER_TAIL_MAX_CHARS = 300
+
 
 def parse_need_marker(raw):
     """
@@ -1355,11 +1365,37 @@ def parse_need_marker(raw):
       模型解释这个协议本身时就是这种句子，误判的代价是白等 30 秒重搜一轮。
     """
     m = NEED_MARKER_RE.match(raw or '')
+    _how = '整条就是标记'
     if not m:
         m = NEED_MARKER_RE.match((raw or '').strip().split('\n', 1)[0])
+        _how = '第一行是标记'
+    if not m:
+        # ★ 认**最后一行**（第十八轮补七，用户实撞）。
+        #
+        #   实测现场：模型先写了一句话，**再**另起一行写标记 ——
+        #       「我需要先联网确认这四个模型文件的真实上游地址，不能凭猜写进 workflow。
+        #
+        #        [[SEARCH]]」
+        #   整条 53 字。老判据只认「整条」和「第一行」，于是**没认出来** ——
+        #   标记被当普通文字露给用户，这一轮直接结束
+        #   （用户看到的是：它说要联网，然后什么都没发生）。
+        #
+        #   为什么敢认最后一行：**标记必须独占那一行**（`NEED_MARKER_RE` 要求
+        #   整行只有标记）。模型在正文里解释这个协议时是**夹在句子里**的
+        #   （「当我说 [[SEARCH]] 的时候……」），不会独占一行 —— 那种仍然不认。
+        #
+        #   ★ 再加一道「回复别太长」的限制：解释协议的长回答末尾**单独**贴一个
+        #     标记当例子，是唯一想得到的误判形状。限制在 300 字以内，
+        #     既盖住真实的申请（实测 53 字），又把长篇解释挡在外面。
+        _t = (raw or '').strip()
+        if len(_t) <= MARKER_TAIL_MAX_CHARS:
+            _last = _t.split('\n')[-1]
+            m = NEED_MARKER_RE.match(_last)
+            _how = '最后一行是标记'
     if not m:
         return False, False
     which = re.sub(r'\s+', '', m.group(1)).upper()
+    ds.log(f'[申请] 识别到开关标记（{_how}）：{which}')
     return 'SEARCH' in which, 'THINK' in which
 
 
@@ -1782,7 +1818,9 @@ def build_delta_prompt(new_msgs, tools=None):
             '（有岔路口要人拍板 → 用 AskUserQuestion 问，别自己猜；'
             '复杂的活 → 先 EnterPlanMode 拿方案；三步以上 → 先 TodoWrite 列清单；'
             '工具名照抄清单 —— 跑命令那个叫 `PowerShell`，不叫 `Bash`；'
-            '跑 Python 用 `python`，**别用 `py -3`**（这台机器上它是坏的）。）')
+            '跑 Python 用 `python`，**别用 `py -3`**（这台机器上它是坏的）；'
+            '**要联网别调 `WebSearch`**（这边执行不了，白烧一轮），'
+            '写 `[[SEARCH]]` 标记。）')
 
 
 def ask_web(prompt, goto_url=None, think=None, attachments=None,
