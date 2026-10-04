@@ -1272,6 +1272,98 @@ def _poll_interval(t0, now=None):
     return POLL_FAST if (now or time.time()) - t0 < POLL_FAST_WINDOW else POLL_SLOW
 
 
+def structurally_closed(txt):
+    """
+    这段文本**从结构上**看已经写完了吗？
+
+    ★★ 现在**只用于「早收工评估」的统计，不改任何行为**（第十八轮补十）。
+      详见下面 EARLY_EXIT_NOTE。
+
+    判据（三条都成立才算）：
+      ① 围栏是偶数 —— 代码块闭合了
+      ② 花括号 / 方括号配平 —— 半截的 JSON 必然不配平
+      ③ 末尾是「收尾字符」—— } ] ) > ` 或句末标点
+
+    ⚠️ **已知它挡不住的一种形状**：模型先写完整的 JSON，**代码块还没来** ——
+       那一刻围栏数是 0（也是偶数！），括号也配平，于是判成「收尾了」。
+       而 `Write` 的长内容恰恰走后面的代码块 —— 这时候提前收工就是
+       **内容全丢**（就是「缺 content」那一族）。
+       真正能挡它的是「解析出来的工具调用有没有缺长字段」，
+       而那个信息在 claude_shim 那边（`needy_calls`）。
+       **所以真要开提前收工时，得让 shim 传一个更强的判据进来**，
+       不能只用这个函数。
+    """
+    t = (txt or '').rstrip()
+    if not t:
+        return False
+    if t.count('```') % 2:
+        return False
+    if t.count('{') != t.count('}') or t.count('[') != t.count(']'):
+        return False
+    return t[-1] in '}])>`。！？.!?…'
+
+
+# 「提前收工」打算等多久才收（秒）—— 评估用的就是这个数：
+# 「收尾之后超过它还在长」才算危险。定 1.5 是拿现状倒推的：
+# 一轮里我们自己的开销约 7 秒，其中稳定性窗口占 4 秒；
+# 提前收工若只能省到 1.5 秒，那 2.5 秒就是收益。
+EARLY_EXIT_FAST = 1.5
+
+
+# 早收工评估的说明（第十八轮补十）—— 这段是**给下一个动这个旋钮的人**看的。
+#
+# 背景：`STABLE_NORMAL` 从 2.5 抬到 4.0（补五，为了「绝不交半截」）。
+# 实测它占一轮的约 40%（一轮中位 6~9 秒）—— 是现在最大的一块自有开销。
+#
+# 想法：工具调用（dsc 的绝大多数轮）写完时 JSON 必然配平，
+#       「结构收尾」是个**正向**信号，理论上能提前收工、省 ~2.5 秒/轮。
+#
+# ★ 但**先量，不先改**：下面这几行把「结构收尾」出现的时刻记进日志，
+#   行为一个字都不动。攒几天看：
+#       `[早收工评估]` 里出现「收尾之后又变长」的比例高不高
+#   高 → 说明这个信号不可靠，这条优化直接否掉；
+#   极低 → 再开提前收工，并用 e2e_check（它精确数「缺 content」）把关。
+#
+# 判读方法（日志里那一行）：
+#   「结构收尾出现在最后一次变长**前** X 秒」
+#     X 大 → 收尾很早，但它之后还在长 → 早收工**会**截断
+#     X ≈ 0 或「收尾之后再没变长」→ 早收工安全
+
+
+def _log_early_exit_probe(closed_at, last_change, grew_after_closed,
+                          grew_late, txt):
+    """
+    「早收工」到底安不安全 —— 每轮记一笔，攒够样本再决定开不开。
+
+    ★ 为什么用**已有的数据反推**、而不是多等一会儿去观察：
+      多等 = 每一轮都多花时间 = 为了量而把被测对象改了。
+      而这两个时刻本来就在手里：
+        closed_at  —— 文本第一次「结构收尾」的时刻
+        last_change —— 文本**最后一次**变长的时刻
+      `last_change - closed_at` 就是答案：
+        接近 0（或收尾之后再没长过）→ 那时候收工是安全的
+        明显大于 0                  → **收尾之后它还在长**，提前收工就会截断
+    """
+    if closed_at is None:
+        # 这一轮**从来没**出现过「结构收尾」—— 说明这个信号压根不适用（
+        # 比如答案以数字/汉字收尾）。提前收工对它无效，也就不必评估。
+        return
+    early_by = last_change - closed_at
+    if grew_late:
+        # ★ 真正危险的形状：收尾之后**过了 EARLY_EXIT_FAST 秒还在长**。
+        #   要是那时候收工，这些内容就丢了。
+        log(f'[早收工评估] ⚠️ 收尾 {early_by:.1f} 秒后还在长（危险 '
+            f'{grew_late} 次 / 共 {grew_after_closed} 次）—— 不要提前收工')
+    elif grew_after_closed:
+        # 收尾之后确实还长过，但都在 EARLY_EXIT_FAST 之内就长完了 ——
+        # 那按 1.5 秒收工是来得及的。
+        log(f'[早收工评估] 🟡 收尾后又长 {grew_after_closed} 次，'
+            f'但都在 {EARLY_EXIT_FAST:.1f} 秒内（晚的 {early_by:.1f}）—— 勉强安全')
+    else:
+        log(f'[早收工评估] ✅ 收尾即最后一变（末尾 {txt.rstrip()[-1:]!r}）'
+            f'—— 提前收工安全')
+
+
 def wait_answer(page, baseline, think, start_limit=None, total_limit=None,
                 search=False, on_delta=None, baseline_n=None):
     """
@@ -1360,15 +1452,39 @@ def wait_answer(page, baseline, think, start_limit=None, total_limit=None,
     #      买的是「绝不交半截回答」的保险，而不是在等某个信号。
     #      **要再降这个窗口，先重跑 _trunc_probe.py 量一遍按钮延迟。**
     cache = {'last_btn_scan': 0.0}
+    # 早收工评估用的两个记账（只记不改，见 EARLY_EXIT_NOTE）。
+    # closed_at：文本**第一次**看起来「结构收尾」的时刻
+    # grew_after_closed：收尾之后文本又变长的次数 —— 这个数只要 >0，
+    #                    就说明那时提前收工会出问题。
+    closed_at = None
+    grew_after_closed = 0
+    # ★ 「收尾之后**超过 EARLY_EXIT_FAST 秒**才长出来的」才叫**危险**。
+    #   第一次量的时候我只数了「收尾之后还长过没有」，得到的全是
+    #   「又长了 1 次、间隔 0.0 秒」—— 那种**不影响结论**：
+    #   我们打算等 1.5 秒才收工，0.5 秒后就长完的那次早就长过了。
+    #   **判据得对准真正要做的决定，不能对准一个近似量。**
+    grew_late = 0
     while time.time() < deadline:
         time.sleep(_poll_interval(t_start))
 
         txt = last_answer_text(page)
+        # ★ 每次轮询都评估「结构收尾」，**不只在不变化的时候**（第十八轮补十，实测修正）。
+        #   第一版写在「文本没变」那个分支里，结果 `closed_at` 永远晚于
+        #   `last_change`，算出来的差值是负的、**一点信息都没有**。
+        #   我们真正要知道的是「收尾出现在**中途**吗」——
+        #   比如散文写到一个句号、但它还在往下写。那种只有每次都看才发现得了。
+        #   纯字符串计数，几 KB 的文本约 0.1 毫秒，可以忽略。
+        if closed_at is None and txt.strip() and structurally_closed(txt):
+            closed_at = time.time()
         if txt != last_text:
             # ★ 只在**变长**时吐（见 _emit 上面 ① 的说明）——
             #   网页重渲染会让文本变短，那种一律忽略，绝不收回已吐的。
             if len(txt) > len(last_text):
                 _emit(on_delta, streamable_prefix(txt))
+            if closed_at is not None:
+                grew_after_closed += 1
+                if time.time() - closed_at > EARLY_EXIT_FAST:
+                    grew_late += 1
             last_text, last_change = txt, time.time()
             continue
 
@@ -1377,6 +1493,11 @@ def wait_answer(page, baseline, think, start_limit=None, total_limit=None,
             continue
         if not txt.strip():                          # ① 空结果不算数
             continue
+
+        # ★ 早收工评估（只记不改）—— 就在「本来要收工」这一刻记一笔。
+        #   判读见 EARLY_EXIT_NOTE：`grew_after_closed > 0` 说明这个信号不可靠。
+        _log_early_exit_probe(closed_at, last_change, grew_after_closed,
+                              grew_late, txt)
 
         # ★ 文本稳了，但**未必是真的答完了** —— 也可能是页面弹了
         #   「服务器繁忙，请稍后重试」：这一轮压根没生成出回答。
