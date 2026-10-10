@@ -625,6 +625,18 @@ def test_unit():
           'py -3' in _d, _d[:200])
     check('build_prompt 里也讲了解释器这件事',
           'py -3' in cs.build_prompt('你是助手', _msgs, _t))
+    # ★★ 「别按进程名全杀 python」也必须在 delta 里。
+    #   实测（2026-10-11）：模型想清某个端口上「重复起的 python」，敲了
+    #       Get-Process python | Stop-Process -Force
+    #   —— 把 **shim 自己**杀了（后端就是 python），用户当场
+    #   `Unable to connect to API (ConnectionRefused)`；而那个端口上压根
+    #   不是 python（是小米电脑管家的音频组件）。
+    #   这是「脚下地板」级别的坑，两个路径都得说。
+    check('★ delta 路径也提醒「别按进程名全杀 python」',
+          '全杀 python' in _d, _d[:220])
+    check('build_prompt 里也讲了这件事（含「先看清 PID」的正确做法）',
+          '全杀 python' in cs.build_prompt('你是助手', _msgs, _t)
+          and 'Stop-Process -Id' in cs.build_prompt('你是助手', _msgs, _t))
 
     # ★★ 第十八轮补：delta 路径**必须跟着 tools 分岔**。
     #
@@ -1892,6 +1904,180 @@ def test_unit():
     check('非流式报错照旧发 JSON（500 + api_error 正文）',
           'HTTP/1.1 500' in _jb and 'api_error' in _jb, _jb[:150])
 
+    # ── 附件上限：超了网页版**发不出去**（2026-10-08 真实翻车） ──
+    #
+    # ★ 现场：一个跑了 400 轮的会话轮换对话时，把整段历史里的 **42 个附件**
+    #   全带上去了 —— 三种发送方式（点按钮 / JS 点 / 回车）**全部失败**，
+    #   连着 6 次无一例外。而报出来的错是「消息没发出去」，
+    #   **完全指不到「附件太多」上**，白白排查了半天。
+    section('单元 · 附件上限（超了发不出去）')
+    import base64 as _b64
+    _mk = lambda i, mt='image/png': {
+        'type': 'image',
+        'source': {'type': 'base64', 'media_type': mt,
+                   'data': _b64.b64encode(('x%d' % i).encode()).decode()}}
+
+    _few = cs.extract_attachments([{'role': 'user', 'content': [_mk(i) for i in range(3)]}])
+    check('没超上限时原样全带', len(_few) == 3, f'{len(_few)} 个')
+    for _p in _few:
+        try:
+            os.remove(_p)
+        except Exception:
+            pass
+
+    # 15 个：第 0 个是 webp、最后一个（第 14 个）是 gif —— 用来验「留最近的那批」
+    _many = [_mk(i) for i in range(14)] + [_mk(14, 'image/gif')]
+    _many[0] = _mk(0, 'image/webp')
+    _got = cs.extract_attachments([{'role': 'user', 'content': _many}])
+    check('★ 超过上限要截断到 MAX_ATTACH', len(_got) == cs.MAX_ATTACH,
+          f'{len(_got)} 个（上限 {cs.MAX_ATTACH}）')
+    _exts = [os.path.splitext(p)[1] for p in _got]
+    check('★ 保留的是**最近**的那批（最早的被丢掉）',
+          '.gif' in _exts and '.webp' not in _exts, str(_exts))
+    for _p in _got:
+        try:
+            os.remove(_p)
+        except Exception:
+            pass
+
+    # ── 网页对话满了：永远不会再生成，必须**换对话**而不是重试 ──
+    #
+    # ★ 现场：某会话在一个网页对话里跑满 400 轮，20:12 撞上「达到对话长度上限」
+    #   之后，Claude Code 一路退避重试到 20:16（四轮），每轮白等 90 秒，
+    #   报的还是「回答没有开始」—— 完全指错方向。全项目当时对这句话**零处理**。
+    section('单元 · 网页对话满了（要换对话，不是重试）')
+    check('CONV_FULL_WARN 是个常量（上层靠它精确识别，不 match 中文）',
+          isinstance(ds_init.CONV_FULL_WARN, str) and bool(ds_init.CONV_FULL_WARN),
+          repr(getattr(ds_init, 'CONV_FULL_WARN', None)))
+    check('页面选择器配了「达到对话长度上限」',
+          any('对话长度上限' in s for s in ds_init.SEL.get('conv_full', [])),
+          str(ds_init.SEL.get('conv_full')))
+    check('detect 函数存在（和 find_server_busy 同款）',
+          callable(getattr(ds_init, 'find_conv_full', None)))
+    # ★ 顺序锁：这条判断**必须**在通用判断之前。
+    #   反了的话 CONV_FULL_WARN 会被当普通错误抛出去，上游退避重试一路撞墙。
+    check('★ ask_web 里 CONV_FULL 的判断在通用判断之前',
+          src.index('if err == ds.CONV_FULL_WARN')
+          < src.index('if err and err != ds.TRUNCATED_WARN'),
+          '顺序反了 → 满了会被当普通错误，白等 90 秒 × N 轮')
+    check('shim 用专门类型区分（不是当普通错误）',
+          issubclass(cs.ConversationFull, RuntimeError)
+          and 'except ConversationFull:' in src)
+
+    # ★ 轮换的全部机制 = 「忘掉映射 → 下次当新会话」。
+    #   这条用**临时会话表**测，绝不碰真实的那个（那上面挂着 180 多个真会话）。
+    _tf = __import__('tempfile')
+    _tmp_sf = os.path.join(_tf.gettempdir(), 'selftest_sessions.json')
+    _orig_sf = cs.SESSIONS_FILE
+    try:
+        cs.SESSIONS_FILE = _tmp_sf
+        cs.save_sessions({'aaa': {'web_url': 'u1'}, 'bbb': {'web_url': 'u2'}})
+        _ok = cs.forget_session('aaa')
+        _left = cs.load_sessions()
+        check('★ forget_session 只删指定会话（别的会话一个都不许动）',
+              _ok and 'aaa' not in _left and 'bbb' in _left, str(list(_left)))
+        check('忘掉不存在的会话不报错', cs.forget_session('nope') is False)
+    finally:
+        cs.SESSIONS_FILE = _orig_sf
+        try:
+            os.remove(_tmp_sf)
+        except Exception:
+            pass
+
+    # ★ 忘掉之后 decide_prompt 必须给「开新对话 + 全量提示词」——
+    #   这正是「重新敲一次 dsc」走的那条路，Claude Code 那边的历史一个字不丢。
+    _p2, _g2, _pl2, _n2 = cs.decide_prompt([{'role': 'user', 'content': 'x'}],
+                                           None, 'sys', [])
+    check('★ 映射没了 → decide_prompt 给「新会话 + 开新对话」',
+          _g2 is None and _n2 == '新会话', f'goto={_g2} note={_n2}')
+
+    # ★★ 只删磁盘映射**不算换了对话** —— 内存里的标签页还停在那个满对话上，
+    #    轮换后的 tab_for(sid) 会把它原样还回来。
+    #    实测（2026-10-09 14:37）：日志里明明打了「[轮换] 换个对话重发」，
+    #    紧接着下一轮照样报「对话满」，连着五六轮 —— 因为换的只是磁盘上那张表，
+    #    页面一动没动。这个 bug 的形态很阴：**日志看起来是成功的**。
+    check('★ forget_session 必须同时丢掉标签页（只删映射 = 没真换对话）',
+          'ds.drop_tab(sid)' in src,
+          '少了它 → 「轮换」是个空动作，会一直撞同一堵墙')
+    check('drop_tab 对不存在的 key / 空 key 都返回 False（不炸）',
+          ds_init.drop_tab('__不存在的key__') is False and ds_init.drop_tab(None) is False)
+
+    # ★★ 重试的验收标准必须是「真的拿到一个工具调用」。
+    #   只检查「新的这条坏不坏」是**不够**的 —— 一条纯文本回答当然不坏，
+    #   但它意味着这一轮**没有 tool_use**，Claude Code 收不到工具可调，
+    #   这一轮就此结束（用户看到的就是「一到命令就停止」）。
+    #   实测（2026-10-09 14:52）：重试拿回 118 字纯文本，被当成成功放行 ——
+    #   日志里写着「[重试] 成功」，**失败伪装成了成功**。
+    check('★ 重试验收要求「真的拿到工具调用」（纯文本不算成功）',
+          "p2[0] == 'tools' and not retry_reason(p2, tools, raw2)" in src,
+          '放行纯文本 = 这一轮没有 tool_use，这一轮就此结束')
+    check('拿回纯文本时要记一行（别静默当成没修好）',
+          '拿回来的不是工具调用' in src)
+
+    # ── 限流：**账号级**的，重试只会加码 ──
+    #
+    # ★ 实测（2026-10-09 15:24）：页面弹「消息发送过于频繁，请稍后重试」，
+    #   而 shim **不认识这句话** —— 它只在「回答稳定之后」才查繁忙提示。
+    #   于是干等满 91 秒 → 报「回答没有开始」→ Claude Code 立刻重试 → 再撞。
+    #   连着四轮，**每一次都在给限流续命**，而且看起来像「选择器坏了」。
+    section('单元 · 限流（要退避，不要重试）')
+    check('RATE_LIMIT_WARN 是个常量（上层靠它精确识别）',
+          isinstance(ds_init.RATE_LIMIT_WARN, str) and bool(ds_init.RATE_LIMIT_WARN),
+          repr(getattr(ds_init, 'RATE_LIMIT_WARN', None)))
+    check('页面选择器配了「消息发送过于频繁」',
+          any('发送过于频繁' in s for s in ds_init.SEL.get('rate_limit', [])),
+          str(ds_init.SEL.get('rate_limit')))
+    check('detect 函数存在（和 find_conv_full 同款）',
+          callable(getattr(ds_init, 'find_rate_limit', None)))
+    # ★ 这两条的**处理方式相反**，所以选择器不能合并：
+    #   「服务器繁忙」→ 重发有用；「发送过于频繁」→ 重发加码。
+    check('★ 限流和「服务器繁忙」是两套选择器（处理方式相反）',
+          ds_init.SEL.get('rate_limit') != ds_init.SEL.get('server_busy'),
+          '合并了就分不出「该重发」和「该退避」')
+    check('shim 有专门的 RateLimited 类型',
+          issubclass(cs.RateLimited, RuntimeError)
+          and 'except RateLimited as e:' in src)
+    check('★ 限流报的是 **429**，不是 500（500 的话上游 91 秒后又来）',
+          'self._fail(429,' in src,
+          '429 才触发上游的长退避')
+    check('★ 限流的判断在 CONV_FULL 之前（顺序锁）',
+          src.index('if err == ds.RATE_LIMIT_WARN')
+          < src.index('if err == ds.CONV_FULL_WARN'))
+
+    # ── 重试换了回复 → 流式收尾不许按前缀差量砍掉开头 ──
+    #
+    # ★ 实测（2026-10-09 14:52）：第一次尝试吐了「v2 写好了，跑它。」，
+    #   重试换回**另一条** 118 字的回复。收尾时按「已吐的是最终文本的前缀」
+    #   算差量，就从新回复里砍掉开头 11 个字 —— 用户看到的是一句
+    #   **没有开头的话**（「比 1.5 + 摩擦反推机械效率之后…」）。
+    #   两次生成之间毫无关系，前缀差量在这里根本不成立。
+    section('单元 · 重试换回复后，流式收尾不许砍开头')
+    _h5 = _FakeH()
+    _h5.send_response = lambda *a, **k: None
+    _h5.send_header = lambda *a, **k: None
+    _h5.end_headers = lambda: None
+    _h5.wfile = _h5.w
+    _h5._raw_write_end = cs.Handler._raw_write_end.__get__(_h5)
+    _h5._finish_stream = cs.Handler._finish_stream.__get__(_h5)
+    cs.stream_headers(_h5)
+    _dw5 = cs.DeltaWriter(_h5)
+    _dw5.text('v2 写好了，跑它。\n\n')            # ← 第一次生成已经吐出去的
+    _newtxt = '我这就跑，看看对比 1.5 + 摩擦反推机械效率之后会怎样。'
+    _h5._finish_stream(_dw5, {
+        'id': 'm', 'type': 'message', 'role': 'assistant', 'model': 'x',
+        'stop_reason': 'end_turn', 'stop_sequence': None,
+        'content': [{'type': 'text', 'text': _newtxt}]})
+    _body5 = _h5.w.buf.decode('utf-8', 'replace')
+    _d5 = []
+    for _ev in _body5.split('event: content_block_delta'):
+        _mm = __import__('re').search(
+            r'"type": "text_delta", "text": "((?:[^"\\]|\\.)*)"', _ev)
+        if _mm:
+            _d5.append(__import__('json').loads('"' + _mm.group(1) + '"'))
+    check('★ 换了回复之后新文本必须是**完整**的（不许砍掉开头）',
+          ''.join(_d5).endswith(_newtxt),
+          '实际拼出来：%r' % ''.join(_d5)[:90])
+
 
 # ══════════════════════════════════════════════════════════
 # 集成测试：真联网
@@ -1960,7 +2146,15 @@ def test_live():
     #                      不忙的时候红。断言必须区分「选择器坏了」和
     #                      「选择器现在不该命中」——把后者写进前者的判据里，
     #                      得到的就是一条时红时绿的自检。
-    fresh_chat_optional = {'answer_body', 'continue_button', 'server_busy'}
+    #   conv_full       —— 只在**这个网页对话真的满了**时才出现。
+    #   rate_limit      —— 只在**账号被限流**时才出现。
+    #                     后两个是 2026-10-09 加的，当时**漏加进这个集合** ——
+    #                     于是全量自测立刻红了两条（命中 0 个）。这正是上面
+    #                     那段注释警告过的坑：**新增「条件出现」的选择器时，
+    #                     必须同时把它加进这里**，否则就是在要求
+    #                     「此刻 DeepSeek 正好在限流 / 对话正好满了」。
+    fresh_chat_optional = {'answer_body', 'continue_button', 'server_busy',
+                           'conv_full', 'rate_limit'}
     for key, locs in ds.SEL.items():
         n = len(page.eles(locs if isinstance(locs, str) else locs[0], timeout=2))
         if key in fresh_chat_optional:

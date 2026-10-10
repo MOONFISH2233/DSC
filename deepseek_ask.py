@@ -234,6 +234,13 @@ SEL = {
     # 和 continue_button 一个思路：这类提示的 class 是会变的哈希值，
     # **文案**才是产品级的锚点。
     'server_busy': ['text:服务器繁忙', 'text:稍后重试'],
+    # 网页对话满了。★ 出现它就**永远不会开始生成** —— 只能干等到超时，
+    # 然后报「回答没有开始」（一个完全指错方向的错）。见 find_conv_full。
+    'conv_full': ['text:达到对话长度上限', 'text:对话长度上限'],
+    # ★ 账号级限流。**必须和 server_busy 分开**：那条是「这一轮没生成出来」，
+    #   立刻重发就好；这条是**账号级速率限制**，重发只会**加码**。
+    #   （实测 2026-10-09：连着四轮每 91 秒撞一次，全在给限流续命。）
+    'rate_limit': ['text:消息发送过于频繁', 'text:发送过于频繁'],
 }
 
 # 「这一轮没生成出来」的回答长度阈值（配合 find_server_busy 用）。
@@ -252,6 +259,36 @@ MAX_CONTINUES = 6
 #   这里用一句**固定文本**，上层靠 `err == ds.TRUNCATED_WARN` 精确识别，
 #   不要去 match 中文子串（改一个标点就失效，而且可能撞上别的错误）。
 TRUNCATED_WARN = '回答可能被截断（续写没能成功）'
+
+# 网页那边这个对话**满了**的信号（不是错误，是「得换个对话」）。
+#
+# ★ 实测（2026-10-08）：某个会话在一个网页对话里跑满 **400 轮**之后，页面开始
+#   显示「达到对话长度上限，请开启新对话」，**并且再也不会生成任何回答**。
+#   而我们那时候还在傻等 —— 干等满 90 秒 → 报「回答没有开始」→ 上游退避重试
+#   → 再撞同一堵墙。20:12 一直撞到 20:16，四轮全是白等，每轮还白烧 90 秒。
+#   而且那条错**完全指错方向**（「没发出去 / 选择器失效」），日志里看不出真因。
+CONV_FULL_WARN = '网页对话已达长度上限（需要换一个对话）'
+
+# 被**限流**时的信号（不是错误，是「别再发了，退避」）。
+#
+# ★ 实测（2026-10-09 15:24）：页面弹「消息发送过于频繁，请稍后重试」，
+#   而 shim **不认识这句话** —— 它只在「回答稳定之后」才查繁忙提示，
+#   等回答**开始**的那一段根本没查，于是只能干等满 91 秒超时，
+#   报「回答没有开始」，然后 Claude Code 立刻重试、再撞一次。连着四轮。
+#
+# ★ 和 BUSY（「服务器繁忙」）的关键区别：
+#     BUSY 是**这一轮**没生成出来 —— 等几秒重发就好，重发是有用的；
+#     这条是**账号级**速率限制 —— **重发只会加码**，越试越难解除。
+#   所以它必须一路传到上游，让上游按 429 退避（见 claude_shim 的 RateLimited）。
+RATE_LIMIT_WARN = '被限流了（页面提示「消息发送过于频繁」）'
+
+
+# 「对话满了」的检查间隔（秒）。
+#
+# ★ 为什么要降频：它在阶段 1 的轮询循环里，而那一圈是**热路径** ——
+#   每个选择器一次 DOM 查询，密查会把前面几轮刚砍下去的开销又加回来。
+#   而这条提示一旦出现就**不会消失**，2 秒粒度完全够。
+CONV_FULL_SCAN_INTERVAL = 2.0
 
 # 点「继续生成」的容错参数。
 #
@@ -695,6 +732,31 @@ def close_extra_tabs():
     return n
 
 
+def drop_tab(key):
+    """
+    丢掉某个 key 的专属标签页（关掉它，下次 tab_for 会重开一个）。
+
+    ★ 用在「网页对话满了」的轮换路径上：光删磁盘上的映射**不够** ——
+      内存里的 _tabs[sid] 还挂在那个满了的网页对话上，tab_for(sid) 会原样
+      把它还回来，于是轮换后一提问又撞上同一堵墙（实测：换了新对话，
+      还是每轮都报「达到对话长度上限」）。
+
+    返回 True = 确实关掉了一个；False = 本来就没有（没什么可关的）。
+    """
+    if not key:
+        return False
+    with _tabs_lock:
+        ent = _tabs.pop(key, None)
+    if not ent:
+        return False
+    try:
+        ent['tab'].close()
+    except Exception:
+        pass
+    log(f'[标签页] 丢掉了 {(key or "?")[:8]} 的标签页（它挂在满对话上）')
+    return True
+
+
 def connect():
     """
     优先接管已在运行的浏览器（快），没有就用同一个 profile 冷启动。
@@ -768,6 +830,57 @@ def last_answer_text(page):
         return items[-1].text or ''
     except Exception:
         return ''
+
+
+def find_conv_full(page):
+    """
+    页面上有没有「达到对话长度上限」这类提示。
+
+    ★ 和「服务器繁忙」的关键区别：那个是**暂时的**，等几秒重发就好；
+      这个是**永久的** —— 这个对话再也不会生成任何回答，只能换一个。
+      所以看到它不该重试，该让上层去轮换对话（见 claude_shim 的 ConversationFull）。
+
+    ★ 为什么**不**配套长度阈值（对比 find_server_busy 的 BUSY_MIN_CHARS）：
+      那条阈值是为了防「留在历史里的旧繁忙气泡误伤后面的正常短回答」。
+      而这条提示是**页面级**的通知、不在回答气泡里，一旦消失就没了 ——
+      加阈值反而会在「回答很短」时漏判，而漏判的代价是白等 90 秒。
+    """
+    try:
+        for pat in SEL['conv_full']:
+            for ele in page.eles(pat, timeout=0.2):
+                try:
+                    if ele.states.is_displayed:
+                        return ele
+                except Exception:
+                    pass
+    except Exception:
+        pass
+    return None
+
+
+def find_rate_limit(page):
+    """
+    页面上有没有「消息发送过于频繁」这类**限流**提示。
+
+    ★ 和 find_server_busy 是**两回事**，别合并：
+        · 「服务器繁忙」= 这一轮没生成出来 → **重发有用**
+        · 「发送过于频繁」= 账号级速率限制 → **重发只会加码**
+      实测（2026-10-09 15:24）：重试每 91 秒撞一次，连着四轮 —— 每一次都在
+      给限流续命，而我们把「回答没有开始」报上去，看起来像选择器坏了。
+
+    ★ 不配长度阈值（同 find_conv_full）：它是页面级提示、不在回答气泡里。
+    """
+    try:
+        for pat in SEL['rate_limit']:
+            for ele in page.eles(pat, timeout=0.2):
+                try:
+                    if ele.states.is_displayed:
+                        return ele
+                except Exception:
+                    pass
+    except Exception:
+        pass
+    return None
 
 
 def find_server_busy(page):
@@ -1412,6 +1525,7 @@ def wait_answer(page, baseline, think, start_limit=None, total_limit=None,
     t_start = time.time()
     deadline = t_start + start_limit
     started = False
+    _last_full_scan = 0.0
     while time.time() < deadline:
         txt = last_answer_text(page)
         if txt and txt != baseline:
@@ -1422,6 +1536,23 @@ def wait_answer(page, baseline, think, start_limit=None, total_limit=None,
             log(f'[回答] 内容与上一条相同，但回答节点数 {baseline_n} → '
                 f'{len(answers(page))}，按「已开始」处理')
             break
+        # ★ 网页对话满了 → **立刻**收工，别干等满 90 秒。
+        #   满了之后永远不会有回答，等下去只是把「换个对话」这个动作推迟 90 秒，
+        #   而且报出去的错（「回答没有开始」）完全指错方向、查不出真因。
+        _now = time.time()
+        if _now - _last_full_scan >= CONV_FULL_SCAN_INTERVAL:
+            _last_full_scan = _now
+            if find_conv_full(page):
+                log('[对话满] 页面提示「达到对话长度上限」—— 这个对话不会再生成，'
+                    '交给上层换个对话')
+                return None, CONV_FULL_WARN
+            # ★ 被限流也要**立刻**收工 —— 等下去一分钱都不值，而且每重试一次
+            #   都在给限流加码（实测连着四轮每 91 秒撞一次）。
+            #   交给上层按 429 退避，别在这儿干等。
+            if find_rate_limit(page):
+                log('[限流] 页面提示「消息发送过于频繁」—— 立刻收工，'
+                    '交给上游退避（**不要再重试**，重试只会加码）')
+                return None, RATE_LIMIT_WARN
         time.sleep(_poll_interval(t_start))
     if not started:
         return None, '回答没有开始 —— 可能没发出去，或者选择器失效了（跑 --probe 看看）'

@@ -108,6 +108,59 @@ def save_sessions(d):
         ds.log(f'[警告] 会话表存不下来：{e}')
 
 
+def forget_session(sid):
+    """
+    把这个会话的**网页对话映射**删掉 —— 下次它会被当成新会话（开一个新网页对话）。
+
+    ★ 用在「网页对话满了」的轮换路径上（见 handler 里的 ConversationFull）。
+      刻意只删一个键：这台机器上会话表里有 180 多条，全清会连别的会话一起搞乱。
+
+    ★★ 必须**同时**丢掉那个会话的标签页（ds.drop_tab）。
+       只删磁盘映射是不够的 —— 内存里的 _tabs[sid] 还停在那个满了的网页对话上，
+       轮换后 tab_for(sid) 会把这个旧标签页**原样还回来**，于是「换了新对话」
+       根本没换，一提问又撞上同一堵墙。
+       实测（2026-10-09 14:37）：日志里明明打了「[轮换] 换个对话重发」，
+       紧接着下一轮照样报「达到对话长度上限」，连着五六轮 —— 因为换的只是
+       磁盘上那张表，页面一动没动。
+    """
+    if not sid:
+        return False
+    # 先丢标签页。用 try 包住：万一关标签页抛异常，也不该拦着下面的映射清理 ——
+    # 映射清了至少下一轮不会再把请求发给那个满对话。
+    try:
+        ds.drop_tab(sid)
+    except Exception as e:
+        ds.log(f'[警告] 丢掉标签页失败（不影响换对话）：{str(e)[:70]}')
+    with _sessions_lock:
+        sessions = load_sessions()
+        if sessions.pop(sid, None):
+            save_sessions(sessions)
+            ds.log(f'[会话 {sid[:8]}] 忘掉网页对话映射（下次开新的）')
+            return True
+    return False
+
+
+class RateLimited(RuntimeError):
+    """
+    被 DeepSeek **限流**了（页面提示「消息发送过于频繁，请稍后重试」）。
+
+    ★ 为什么要单独一个类型、一路传到 HTTP 层：这是**账号级**速率限制，
+      **重试只会加码**。必须让上游按 429 退避 —— 报 500 的话 Claude Code
+      当成普通服务端错误，91 秒后又来一次（实测 2026-10-09 连着四轮，
+      每一次都在给限流续命，而且看起来像「选择器坏了」）。
+    """
+
+
+class ConversationFull(RuntimeError):
+    """
+    网页那边这个对话满了，**再也不会生成任何回答**。
+
+    ★ 为什么要单独一个异常类型、而不是当普通错误往上抛：普通错误重试有意义，
+      这个**重试永远没用** —— 换一个对话才有用。handler 靠类型区分这两种。
+      （实测：不区分的话，Claude Code 会一路退避重试，每轮白等 90 秒。）
+    """
+
+
 def session_id_of(req):
     """从 metadata.user_id 里挖出 Claude Code 的 session_id。"""
     uid = (req.get('metadata') or {}).get('user_id')
@@ -334,6 +387,25 @@ TOOL_GUIDANCE = """
   能用的解释器 —— 光这一个习惯就让「建几个 py 文件再跑起来」这类任务
   多花 2 轮。**直接写 `python xxx.py` 就对了。**
 
+★ **杀进程之前先看清那个 PID 到底是什么，绝不要「按进程名全杀」。**
+  实测（2026-10-11）：你想清掉某个端口上「重复起的 python」，敲了
+
+      Get-Process python | Stop-Process -Force
+
+  —— 结果**把 shim 自己杀了**（这个项目的后端就是 python），
+  Claude Code 当场 `Unable to connect to API (ConnectionRefused)`，
+  你的会话直接断线；而那个端口上**压根不是 python**（是小米电脑管家的音频
+  组件），**想清的没清掉，不该清的清了一地**。
+
+  **正确做法：先问清楚，再按 PID 动手。**
+
+      Get-NetTCPConnection -LocalPort <端口> -State Listen     # 谁在听
+      Get-CimInstance Win32_Process -Filter "ProcessId=<PID>"  # 那是什么
+
+  确认之后再 `Stop-Process -Id <PID>`（**按 ID**，不要按名字）。
+  记住：这台机器上 **shim、MCP server 都是 python** —— 按名字全杀 python
+  等于把自己脚下的地板拆了。
+
 ★ **耗时的活（下载、编译、批处理）不要用 `Start-Sleep` 反复轮询。**
   实测一次真实的下载任务：你写了四段等待 ——
   `Start-Sleep 25` → 查一次 → `Start-Sleep 90` → 查一次 → `Start-Sleep 120`
@@ -352,6 +424,17 @@ ATTACH_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), '_attachme
 
 _EXT_OF = {'image/png': 'png', 'image/jpeg': 'jpg', 'image/gif': 'gif',
            'image/webp': 'webp', 'application/pdf': 'pdf'}
+
+# 单条消息最多带几个附件 —— 网页版有上限，超了**发送按钮根本点不动**。
+#
+# ★ 实测（2026-10-08）：42 个 → 三种发送方式全失败，连着 6 次无一例外；
+#   17 个 / 10 个时前两种也会失败，但第三种（回车）能救回来。
+#   上限落在 17~42 之间，取 10 留足余量。
+#
+# ★ 为什么这条重要：新会话（或轮换对话）走的是**全量历史**，里面带着这整场
+#   会话读过的所有图片 —— 一个跑了 400 轮的会话能攒出 42 个。
+#   而报出来的错是「消息没发出去」，**完全指不到「附件太多」上**（踩过）。
+MAX_ATTACH = 10
 
 
 _last_cleanup = 0.0
@@ -434,6 +517,21 @@ def extract_attachments(messages):
         c = m.get('content')
         if isinstance(c, list):
             walk(c)
+
+    # ★★ 单条消息能带几个附件 —— 网页版有上限，**超了发送按钮根本点不动**。
+    #
+    #   实测（2026-10-08）：42 个 → 三种发送方式（点按钮 / JS 点 / 回车）**全失败**，
+    #   连着 6 次无一例外；而 17 个 / 10 个时前两种也会失败，但第三种能救回来。
+    #   上限落在 17~42 之间，取 10 留足余量。
+    #
+    #   ★ 报出来的错是「消息没发出去」，**完全指不到「附件太多」上** ——
+    #     这是它值得在这儿拦一道的原因。
+    #   ★ 为什么保留**最近**的 N 个：最新读进来的图，最可能是眼下这轮要用的。
+    #     丢掉的会记一行日志 —— 不静默降级（这个项目的规矩）。
+    if len(paths) > MAX_ATTACH:
+        ds.log(f'[附件] {len(paths)} 个 > 单条上限 {MAX_ATTACH} —— '
+               f'只带最近 {MAX_ATTACH} 个（再多了网页版发不出去）')
+        paths = paths[-MAX_ATTACH:]
     return paths
 
 
@@ -1930,6 +2028,8 @@ def build_delta_prompt(new_msgs, tools=None):
             '复杂的活 → 先 EnterPlanMode 拿方案；三步以上 → 先 TodoWrite 列清单；'
             '工具名照抄清单 —— 跑命令那个叫 `PowerShell`，不叫 `Bash`；'
             '跑 Python 用 `python`，**别用 `py -3`**（这台机器上它是坏的）；'
+            '**杀进程前先看清那个 PID 是什么，绝不按进程名全杀 python**'
+            '（shim/MCP 都是 python，杀了你自己就断线）；'
             '**要联网别调 `WebSearch`**（这边执行不了，白烧一轮），'
             '写 `[[SEARCH]]` 标记；'
             '耗时的活让它一次跑完、别用 `Start-Sleep` 反复轮询。）')
@@ -1963,6 +2063,14 @@ def ask_web(prompt, goto_url=None, think=None, attachments=None,
         navigate_to=goto_url, start_limit=start_limit, total_limit=total_limit,
         # key = 会话 id → 每个 dsc 会话用自己的标签页
         key=key, search=search, skip_toggles=skip_toggles, on_delta=on_delta)
+    # ★ 对话满了要**单独抛**：它不是「这次没成」，是「**这个对话再也成不了**」。
+    #   当普通错误抛的话，上游退避重试会一路撞同一堵墙，每轮白等 90 秒
+    #   （实测 20:12 撞到 20:16，四轮全废）。见 ConversationFull 的说明。
+    # ★ 限流：**账号级**的，重试只会加码 —— 单独抛，让 handler 报 429。
+    if err == ds.RATE_LIMIT_WARN:
+        raise RateLimited(err)
+    if err == ds.CONV_FULL_WARN:
+        raise ConversationFull(err)
     if err and err != ds.TRUNCATED_WARN:
         raise RuntimeError(err)
     # ★ TRUNCATED_WARN **不是失败**，是「这轮可能是半截」的提醒 ——
@@ -2176,6 +2284,25 @@ class Handler(BaseHTTPRequestHandler):
         try:
             text = ''.join(b.get('text', '') for b in msg['content']
                            if b.get('type') == 'text')
+            # ★★ 已经吐出去的那段，必须是最终文本的**真前缀**，差量算法才成立。
+            #
+            #   而重试会把整条回复**换掉**（见下面「重试」那段）—— 换来的那条和
+            #   已经吐出去的那段是**两次不同的生成**，彼此毫无关系。这时候再按
+            #   前缀算差量，就会从新回复里砍掉开头 len(shown) 个字，用户看到的
+            #   是**一句没有开头的话**。
+            #
+            #   实测（2026-10-09 14:52）：屏幕上显示
+            #       「比 1.5 + 摩擦反推机械效率之后，扫描结果和冻结设计点变成什么样。」
+            #   而模型原话是
+            #       「我这就跑，看看对比 1.5 + 摩擦反推机械效率之后，扫描结果…」
+            #   —— 正好少了开头 11 个字（= 第一次尝试已经吐出去的那段）。
+            #
+            #   不是前缀 → 放弃差量记账、整段重发。前端会看到两段（先旧后新），
+            #   但**至少是完整的**：宁可重复，也不要一句缺开头的话。
+            if text and dw.shown and not text.startswith(dw.shown):
+                ds.log('[流式] 收尾文本和已吐出去的对不上（多半是重试换了回复）—— '
+                       '整段重发，不走前缀差量')
+                dw.shown = ''
             if text and len(text) > len(dw.shown):
                 dw.text(text)
             idx = dw.close_text()
@@ -2435,6 +2562,48 @@ class Handler(BaseHTTPRequestHandler):
         try:
             raw, web_url = ask_web(prompt, goto, think, attach, key=sid, search=search,
                                    on_delta=on_delta)
+        except RateLimited as e:
+            # ★★ 被限流 —— **快速失败，绝不重试**。
+            #
+            #   报 **429**（不是 500）：Claude Code 对 429 的退避比 500 长得多，
+            #   于是它自己就会安静下来。而报 500 的话它会 91 秒后又来一次 ——
+            #   实测（2026-10-09 15:24）连着四轮，每一次都在给限流加码，
+            #   越试越难解除，而报上去的错是「回答没有开始」，完全指错方向。
+            ds.log('[限流] 交给上游按 429 退避（本轮不重试 —— 重试只会加码）')
+            self._fail(429, str(e), streaming=streaming, dw=dw)
+            return
+        except ConversationFull:
+            # ★★ 网页对话满了 —— 这个对话**永远不会再生成任何回答**。
+            #
+            #   实测（2026-10-08）：某会话在一个网页对话里跑满 400 轮之后撞上它，
+            #   页面开始显示「达到对话长度上限，请开启新对话」。当时没有这条分支，
+            #   于是 Claude Code 一路退避重试（20:12 → 20:16，四轮），每轮白等 90 秒，
+            #   而且报出去的错是「回答没有开始」—— 完全指错方向。
+            #
+            #   做法：把这个会话的映射**忘掉**，改成「新会话」重发一次。
+            #   `decide_prompt(messages, None, ...)` 给的就是「全量提示词 + 开新对话」，
+            #   和「重新敲一次 dsc」走的是同一条路 —— 而 Claude Code 那边的会话
+            #   **一个字都不丢**（它的历史本来就是每轮全量发过来的）。
+            #
+            #   ★ 附件要**重算**：轮换后 payload 从「增量 2 条」变成「全量历史」，
+            #     能带出来的图比刚才多（也正是 42 个附件那次翻车的来源，
+            #     现在由 MAX_ATTACH 兜住）。
+            if not sid:
+                self._fail(500, '网页对话已达长度上限，但没有 session_id 可用于换对话',
+                           streaming=streaming, dw=dw)
+                return
+            forget_session(sid)
+            prompt, goto, payload_msgs, note = decide_prompt(messages, None, system, tools)
+            attach = extract_attachments(payload_msgs)
+            ds.log(f'[轮换] 网页对话满了 → 换个对话重发 · {note} · '
+                   f'提示词 {len(prompt)} 字 · 附件 {len(attach)} 个')
+            try:
+                raw, web_url = ask_web(prompt, None, think, attach, key=sid, search=search,
+                                       on_delta=on_delta)
+            except Exception as e:
+                ds.log(f'[轮换] 换了对话还是失败：{e}')
+                self._fail(500, str(e), streaming=streaming, dw=dw)
+                return
         except Exception as e:
             ds.log(f'[失败] {e}')
             self._fail(500, str(e), streaming=streaming, dw=dw)
@@ -2591,13 +2760,26 @@ class Handler(BaseHTTPRequestHandler):
                 #   重试，两次都这样就是 500。实测日志正是这个形状（见
                 #   parse_and_align 的说明）。
                 p2 = parse_and_align(raw2, tools)
-                if not retry_reason(p2, tools, raw2):
+                # ★★ 验收标准：**必须真的拿到一个工具调用**（`p2[0] == 'tools'`）。
+                #
+                #   重试是冲着「刚才那个工具调用写坏了」去的，所以「新的这条不坏」
+                #   **远远不够** —— 一条**纯文本回答**当然不坏，但它意味着这一轮
+                #   **没有 tool_use**：Claude Code 收不到工具可调，这一轮就此结束。
+                #
+                #   实测（2026-10-09 14:52）：重试拿回一条 **118 字的纯文本**，
+                #   被当成成功放行 —— 日志里写着「[重试] 成功」，用户那边却是
+                #   「一到命令就停止」。**失败伪装成成功**，正是这个项目最怕的那类。
+                if p2[0] == 'tools' and not retry_reason(p2, tools, raw2):
                     parsed, raw = p2, raw2
                     # ★ web_url 刻意不更新 —— 重试用的是临时对话，
                     #   主对话还是原来那个，下一轮继续在它上面接着聊。
                     ds.log('[重试] 成功（在临时对话里做的，主对话没被污染）')
                     break
-                ds.log('[重试] 还是坏的，接着重问')
+                if p2[0] != 'tools':
+                    ds.log('[重试] 拿回来的不是工具调用（%d 字纯文本）—— 当成没修好'
+                           % len(p2[1] or ''))
+                else:
+                    ds.log('[重试] 还是坏的，接着重问')
             except Exception as e:
                 ds.log(f'[重试] 失败：{e}')
                 # 重试本身出错（网页超时 / 服务器繁忙）—— 再试多半还是错。
